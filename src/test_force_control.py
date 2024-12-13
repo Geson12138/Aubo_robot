@@ -315,21 +315,6 @@ if __name__ == '__main__':
         ee_ori_rpy_rad = np.round(np.array(robot.quaternion_to_rpy(ee_ori_quater)),4) # # 当前末端姿态 in rad
         ee_ori_rpy_deg = np.round(ee_ori_rpy_rad/np.pi*180,2) # # 当前末端姿态 in degree
 
-        '''
-        初始化阻抗控制器
-        '''
-        # 定义质量、刚度和阻尼比
-        mass = [30.0, 30.0, 30.0, 0.2, 0.2, 0.2]  # 惯性参数
-        stiffness = [100.0, 100.0, 100.0, 10.0, 10.0, 10.0]  # 刚度参数
-        damping_ratio = 0.9  # 阻尼比（ξ）
-        dt = 0.01  # 控制周期（单位：秒）
-
-        # 初始化导纳参数
-        controller = AdmittanceController(mass, stiffness, damping_ratio, dt)
-
-        # 期望六维位置和速度
-        desired_position = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-        desired_velocity = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
         '''
         模拟圆弧轨迹规划
@@ -363,7 +348,7 @@ if __name__ == '__main__':
         先进行路径规划, 规划每一个目标点的位姿
         '''
         # 计算圆轨迹上的点
-        num_points = 5000  # 圆轨迹上的点数
+        num_points = 4000  # 圆轨迹上的点数
         angles = np.linspace(0, 2 * np.pi, num_points)
         p_end_list = []
 
@@ -388,7 +373,7 @@ if __name__ == '__main__':
         设置servoj轨迹规划参数
         '''
         # initialize control parameters
-        control_period = 0.01  # Control period (s)
+        control_period = 0.03  # Control period (s)
         lookahead_time = 0.2  # Lookahead time (s)
         num_joints = 6  # Number of joints
 
@@ -402,7 +387,26 @@ if __name__ == '__main__':
         # initialize whole trajectory data
         all_positions_desired = []
         all_positions_real = []
+
+        current_waypoint = robot.get_current_waypoint()
+        prev_angles = np.array(current_waypoint['joint']) # in rad
         
+        '''
+        设置admittance control阻抗控制器参数
+        '''
+        # 定义质量、刚度和阻尼比
+        mass = [30.0, 30.0, 30.0, 1.0, 1.0, 1.0]  # 惯性参数
+        stiffness = [100.0, 100.0, 100.0, 20.0, 20.0, 20.0]  # 刚度参数
+        damping_ratio = 0.9  # 阻尼比（ξ）
+        dt = control_period # 阻抗控制周期（单位：秒）
+
+        # 初始化导纳参数
+        controller = AdmittanceController(mass, stiffness, damping_ratio, dt)
+
+        # 期望六维位置和速度
+        desired_position = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        desired_velocity = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
         '''
         开始规划期望轨迹并跟踪
         '''
@@ -412,24 +416,29 @@ if __name__ == '__main__':
 
             st_time = time.time()
             
-            # 获取当前位置、速度和加速度
+            # 获取当前关节角度
             current_waypoint = robot.get_current_waypoint()
-            all_positions_real.append(np.array(current_waypoint['joint'])) # in rad
-
-            if i == 0:
-                current_angles = np.array(current_waypoint['joint']) # in rad 
-                prev_angles = np.array(current_waypoint['joint']) # in rad
-            else:
-                # 直接用上一控制周期的目标位置作为当前位置
-                current_angles = positions[1,:]
-
-            # 差分计算当前速度和加速度
+            current_angles = np.array(current_waypoint['joint']) # in rad 
+            all_positions_real.append(current_angles) # in rad
+            
+            # 差分计算当前关节角速度和角加速度
             current_velocities = (current_angles - prev_angles) / control_period
             current_accelerations = (current_velocities - prev_velocities) / control_period
 
-            # 设置期望位置、速度和加速度
+            # 获取当前末端位置和姿态
+            pykin_result = pykin.forward_kin(current_angles)
+            py_ee_pos = np.array(pykin_result[pykin.eef_name].pos) # 当前末端位置 in m    
+            py_ee_ori_rpy_rad =np.array(transform_utils.get_rpy_from_quaternion(pykin_result[pykin.eef_name].rot)) #  当前末端姿态 in rad
+            controller.position = np.concatenate((py_ee_pos, py_ee_ori_rpy_rad), axis=0) # 6*1
+
+            # 根据规划的路径获取旧的末端期望位姿
             desired_position = p_end_array[i, :]
-            q_target = robot_inverse_kinematic(desired_position[:3],desired_position[3:])
+
+            # 通过导纳控制器计算新的末端期望位姿
+            updated_position = controller.update(desired_position, desired_velocity, calib_force_data)
+
+            # 设置期望位置、速度和加速度
+            q_target = robot_inverse_kinematic(updated_position[:3],updated_position[3:])
             v_target = np.zeros(num_joints)  # Assume target velocities are zero
             a_target = np.zeros(num_joints)  # Assume target accelerations are zero
 
@@ -465,18 +474,6 @@ if __name__ == '__main__':
                 pass
             else:
                 time.sleep(control_period - elapsed_time)
-
-
-            # # 获取当前位置
-            # current_waypoint = robot.get_current_waypoint()
-            # current_joint_rad = np.round(np.array(current_waypoint['joint']),4) # in rad
-            # ee_pos = np.array([np.round(i,4) for i in current_waypoint['pos']]) # 当前末端位置 in m
-            # ee_ori_quater = np.round(np.array(current_waypoint['ori']),4) # 当前末端姿态 in quaternion
-            # ee_ori_rpy_rad = np.round(np.array(robot.quaternion_to_rpy(ee_ori_quater)),4) # # 当前末端姿态 in rad
-            # controller.position = np.concatenate((ee_pos, ee_ori_rpy_rad), axis=0) # 6*1
-                
-            # # 通过导纳控制器计算新的期望位置
-            # updated_position = controller.update(desired_position, desired_velocity, calib_force_data)
 
         # 设置三维图形的标签
         ax.set_xlabel('X')

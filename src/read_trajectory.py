@@ -24,6 +24,10 @@ n_samples = trajectory_array_real.shape[0]
 fig, axes = plt.subplots(6, 1, figsize=(12, 18))
 joint_labels = ['Joint 1', 'Joint 2', 'Joint 3', 'Joint 4', 'Joint 5', 'Joint 6']
 
+for i in np.arange(20):
+    print(abs(trajectory_array[i, :]-trajectory_array_real[i+1, :]))
+
+
 # 绘制每个关节的变化曲线
 for i in range(6):
     axes[i].plot(np.arange(n_samples), trajectory_array[:n_samples, i], label=joint_labels[i], color='blue')

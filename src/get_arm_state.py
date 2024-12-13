@@ -71,7 +71,9 @@ if __name__ == '__main__':
             robot.set_collision_class(7)
 
             # 获取机械臂状态
+            st_time = time.time()
             current_waypoint = robot.get_current_waypoint()
+            print('time get current joint: ',time.time()-st_time)
 
             # 当前关节角 
             real_joint_rad = np.round(np.array(current_waypoint['joint']),4) # in rad
