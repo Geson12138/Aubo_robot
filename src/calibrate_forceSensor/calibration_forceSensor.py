@@ -18,6 +18,7 @@ from pykin.robots.single_arm import SingleArm
 from pykin.utils import transform_utils as transform_utils
 from datetime import datetime
 from collections import deque
+from scipy.signal import butter, filtfilt
 
 # 创建一个logger
 logger = logging.getLogger('calibration_forceSensor')
@@ -324,24 +325,37 @@ def validate_calibrate_result(robot):
     global force_data
 
     # 初始化一个队列用于存储前5次的力传感器数据
-    force_data_queue = deque(maxlen=20)
+    force_data_queue = deque(maxlen=10)
+
+    # 定义滤波器参数
+    cutoff = 5  # 截止频率 (Hz)
+    order = 2    # 滤波器阶数
+    fs = 200  # 根据实际情况设置采样频率 (Hz)
+    b, a = butter(order, cutoff / (0.5 * fs), btype='low', analog=False) # 设计低通Butterworth滤波器
+
+    alpha = 0.8
+    smoothed_force_data = np.array(force_data).copy()
 
     while running:
 
         raw_force_data = np.array(force_data).copy()
 
-        '''
-        移动均值滤波
-        '''
+        # '''
+        # 移动均值滤波
+        # '''
         # 将当前的力传感器数据添加到队列中
         force_data_queue.append(raw_force_data)
 
         # 如果队列中的数据少于5次，则继续等待
-        if len(force_data_queue) < 20:
+        if len(force_data_queue) < 10:
             continue
 
-        # 计算移动平均滤波后的力传感器数据
-        smoothed_force_data = np.mean(force_data_queue, axis=0)
+        # 应用滤波器
+        filtered_signal = filtfilt(b, a, force_data_queue, axis=0)
+        new_force_data = filtered_signal[-1]
+
+        smoothed_force_data = alpha * new_force_data  + (1-alpha) * smoothed_force_data
+        # smoothed_force_data = np.mean(filtered_signal, axis=0)
 
         '''
         获取机械臂当前的末端姿态, 需要根据不同的机械臂型号和通信协议获取

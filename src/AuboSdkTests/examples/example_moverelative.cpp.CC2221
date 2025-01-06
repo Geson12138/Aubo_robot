@@ -1,0 +1,43 @@
+#include "example_moverelative.h"
+#include "AuboRobotMetaType.h"
+#include "serviceinterface.h"
+
+#include <unistd.h>
+#include <math.h>
+#include <string.h>
+#include <stdio.h>
+#include <sstream>
+#include <fstream>
+
+#define SERVER_HOST "192.168.221.13"
+#define SERVER_PORT 8899
+
+Example_MoveRelative::Example_MoveRelative()
+{
+
+}
+
+void Example_MoveRelative::demo1()
+{
+
+}
+
+void Example_MoveRelative::demo2()
+{
+
+}
+
+void Example_MoveRelative::demo3()
+{
+
+}
+
+void Example_MoveRelative::demo4()
+{
+
+}
+
+void Example_MoveRelative::demo5()
+{
+
+}

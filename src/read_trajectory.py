@@ -30,8 +30,8 @@ for i in np.arange(20):
 
 # 绘制每个关节的变化曲线
 for i in range(6):
-    axes[i].plot(np.arange(n_samples), trajectory_array[:n_samples, i], label=joint_labels[i], color='blue')
-    axes[i].plot(np.arange(n_samples), trajectory_array_real[:, i], label=joint_labels[i], color='red')
+    axes[i].plot(np.arange(n_samples), trajectory_array[:n_samples, i], label=f'Desired {joint_labels[i]}' ,color='blue')
+    axes[i].plot(np.arange(n_samples), trajectory_array_real[:, i], label=f'Real {joint_labels[i]}', color='red')
     axes[i].set_xlabel('Sample')
     axes[i].set_ylabel('Angle (rad)')
     axes[i].legend()

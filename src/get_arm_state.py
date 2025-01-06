@@ -32,6 +32,8 @@ def logger_init():
     logger.addHandler(fh) # 设置文件输出到logger
     logger.addHandler(ch) # 设置控制台输出到logger
 
+def joint_status_callback(robot):
+    print("joint_status_callback: ", robot.last_event)
 
 if __name__ == '__main__':
 

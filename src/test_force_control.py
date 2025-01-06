@@ -16,6 +16,8 @@ from mpl_toolkits.mplot3d import Axes3D
 from admittance_controller import AdmittanceController
 from scipy.signal import butter, filtfilt
 from scipy.interpolate import CubicSpline
+import rospy
+from std_msgs.msg import Float64MultiArray
 
 
 # 创建一个logger
@@ -73,13 +75,12 @@ def read_force_data(sock, robot):
     # 定义滤波器参数
     cutoff = 4  # 截止频率 (Hz)
     order = 2    # 滤波器阶数
-
-    # 获取采样频率
     fs = 200  # 根据实际情况设置采样频率 (Hz)
+    b, a = butter(order, cutoff / (0.5 * fs), btype='low', analog=False) # 设计低通Butterworth滤波器
 
-    # 设计低通Butterworth滤波器
-    b, a = butter(order, cutoff / (0.5 * fs), btype='low', analog=False)
-
+    alpha = 0.8 # 滑动窗口加权滤波
+    smoothed_force_data = np.zeros(6) # 平滑后的力传感器数据
+    
     while running:
 
         data = sock.recv(4096)
@@ -116,19 +117,16 @@ def read_force_data(sock, robot):
 
             # 将当前的力传感器数据添加到队列中
             force_data_queue.append(raw_force_data)
-
             # 如果队列中的数据少于5次，则继续等待
             if len(force_data_queue) < length_force_data_queue:
                 continue
-            
             # 将 force_data_queue 转换为 NumPy 数组
             force_data_array = np.array(force_data_queue)
-
             # 应用滤波器
             filtered_signal = filtfilt(b, a, force_data_array, axis=0)
+            new_force_data = filtered_signal[-1]
 
-            # 计算移动平均滤波后的力传感器数据
-            smoothed_force_data = np.mean(filtered_signal, axis=0)
+            smoothed_force_data = alpha * new_force_data  + (1-alpha) * smoothed_force_data
 
             '''
             获取机械臂当前的末端姿态, 需要根据不同的机械臂型号和通信协议获取
@@ -155,14 +153,13 @@ def read_force_data(sock, robot):
 
             # 标定后的力数据 = 原始力传感器数据 - 力传感器零点 - 负载重力分量 - 手动清零分量
             calib_force_data = smoothed_force_data - force_zero - G_force - force_zero_point # 6*1
-
-            # print('calib_force_data: ',calib_force_data)
-            # print('pose_data: ',pose_data)
             
             # 保存数据
             force_data_list.append(calib_force_data) # 末端受到的外部力
             pose_data_list.append(pose_data) # 末端位置和姿态
             time_list.append(time.time() - start_time) # 时间
+
+            time.sleep(0.004) # 5ms/次
 
 def force_data_zero():
     '''
@@ -170,7 +167,6 @@ def force_data_zero():
     '''
     global force_zero_point, calib_force_data
     force_zero_point = calib_force_data.copy()
-    print('force_zero_point:, ',force_zero_point)
     
 
 def robot_inverse_kinematic(target_pos,target_ori_rpy_rad):
@@ -234,6 +230,220 @@ def generate_trajectory(q_start, v_start, a_start, q_end, v_end, a_end, control_
 
     return positions, velocities, accelerations
 
+def main_controller():
+
+    # 控制主程序
+        
+    # 设置碰撞等级
+    robot.set_collision_class(6)
+    # 初始化全局配置文件 自动清理掉之前设置的用户坐标系，速度，加速度等属性
+    robot.init_profile() 
+
+    # 设置关节最大加速度 rad/s^2
+    robot.set_joint_maxacc((2.5, 2.5, 2.5, 2.5, 2.5, 2.5)) 
+    # 设置关节最大速度 rad/s
+    robot.set_joint_maxvelc((2, 2, 2, 2, 2, 2))
+    # 设置末端运动最大线加速度 m/s^2
+    line_maxacc = 0.6
+    robot.set_end_max_line_acc(line_maxacc)
+    # 设置末端运动最大线速度 m/s
+    line_maxvelc = 0.6
+    robot.set_end_max_line_velc(line_maxvelc)
+
+    # robot.move_joint(tuple([1.5756, -0.0999, -1.7131, 1.5337, 1.6265, 3.0839]))
+
+    '''
+    获取当前末端位姿
+    '''
+    current_waypoint = robot.get_current_waypoint()
+    current_joint_rad = np.round(np.array(current_waypoint['joint']),4) # in rad
+    ee_pos = np.array([np.round(i,4) for i in current_waypoint['pos']]) # 当前末端位置 in m
+    ee_ori_quater = np.round(np.array(current_waypoint['ori']),4) # 当前末端姿态 in quaternion
+    ee_ori_rpy_rad = np.round(np.array(robot.quaternion_to_rpy(ee_ori_quater)),4) # # 当前末端姿态 in rad
+    ee_ori_rpy_deg = np.round(ee_ori_rpy_rad/np.pi*180,2) # # 当前末端姿态 in degree
+
+
+    '''
+    模拟圆弧轨迹规划
+    '''
+    radius = 0.06  # 圆的半径
+    p_start = ee_pos.copy() # 起点位置
+    p_center = ee_pos.copy() # 圆心位置为起点
+    # p_start[0] = p_start[0] + radius # 移动到最高点
+
+    desired_joint = robot_inverse_kinematic(p_start,ee_ori_rpy_rad) # 末端期望位置 / m， 角度rqy / rad
+    print('desired_joint: ', [r_qd/np.pi*180 for r_qd in desired_joint])
+    robot.move_joint(desired_joint)
+    time.sleep(1)
+    
+    '''
+    进入 TCP 转 CAN 透传模式
+    '''
+    flag_enter_tco2canbus = False
+    result = robot.enter_tcp2canbus_mode()
+    if result != RobotErrorType.RobotError_SUCC:
+        logger.info("TCP 转 CAN 透传模式失败, 错误码：{}".format(result))
+    else:
+        logger.info("TCP 转 CAN 透传模式成功")
+        flag_enter_tco2canbus = True
+
+    '''
+    先进行路径规划, 规划每一个目标点的位姿
+    '''
+    # 计算圆轨迹上的点
+    num_points = 4000  # 圆轨迹上的点数
+    angles = np.linspace(0, 2 * np.pi, num_points)
+
+    for angle in angles:
+
+        # x = p_center[0] + radius * np.cos(angle)
+        # y = p_center[1]
+        # z = p_center[2] + radius * np.sin(angle)
+        x = p_start[0]
+        y = p_start[1]
+        z = p_start[2]
+        rx = ee_ori_rpy_rad[0]
+        ry = ee_ori_rpy_rad[1]
+        rz = ee_ori_rpy_rad[2]
+        p_end = np.array([x, y, z, rx, ry, rz])
+        p_end_list.append(p_end)
+
+    p_end_array = np.array(p_end_list)
+    num_points = p_end_array.shape[0] # 轨迹上点的数量
+
+    '''
+    设置servoj轨迹规划参数
+    '''
+    # initialize control parameters
+    control_period = 0.005  # Control period (s) 每隔5ms下发一次运动指令
+    lookahead_time = 0.2  # Lookahead time (s) 前瞻时间，用0.2s规划轨迹
+    num_joints = 6  # Number of joints
+
+    # initialize trajectory data
+    current_angles = np.zeros(num_joints) # [0, 0, 0, 0, 0, 0]
+    current_velocities = np.zeros(num_joints) # [0, 0, 0, 0, 0, 0]
+    current_accelerations = np.zeros(num_joints) # [0, 0, 0, 0, 0, 0]
+
+    prev_velocities = np.zeros(num_joints)
+
+    # initialize whole trajectory data
+    all_positions_desired = []
+    all_positions_real = []
+
+    current_waypoint = robot.get_current_waypoint()
+    prev_angles = np.array(current_waypoint['joint']) # in rad
+    
+    '''
+    设置admittance control阻抗控制器参数
+    '''
+    # 定义质量、刚度和阻尼比
+    mass = [5.0, 5.0, 5.0, 1.0, 1.0, 1.0]  # 惯性参数
+    stiffness = [100.0, 100.0, 100.0, 20.0, 20.0, 20.0]  # 刚度参数
+    damping_ratio = 1  # 阻尼比（ξ）
+    dt = 0.035 # 阻抗控制周期（单位：秒）要跟状态反馈时间保持一致，用于阻抗控制循环
+
+    # 初始化导纳参数
+    controller = AdmittanceController(mass, stiffness, damping_ratio, dt)
+
+    # 期望六维位置和速度
+    desired_position = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    desired_velocity = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+    '''
+    开始规划期望轨迹并跟踪
+    '''
+    force_data_zero()
+
+    for i in range(num_points):
+
+        st_time = time.time()
+        
+        # 获取当前关节角度
+        current_waypoint = robot.get_current_waypoint()
+        current_angles = np.array(current_waypoint['joint']) # in rad 
+        # # 等待并获取最新的 joint_angles 话题消息
+        # joint_msg = rospy.wait_for_message('joint_angles', Float64MultiArray)
+        # current_angles = np.array(joint_msg.data) # in rad
+        all_positions_real.append(current_angles) # in rad
+        
+        # 差分计算当前关节角速度和角加速度
+        current_velocities = (current_angles - prev_angles) / control_period
+        current_accelerations = (current_velocities - prev_velocities) / control_period
+
+        # 获取当前末端位置和姿态
+        pykin_result = pykin.forward_kin(current_angles)
+        py_ee_pos = np.array(pykin_result[pykin.eef_name].pos) # 当前末端位置 in m    
+        py_ee_ori_rpy_rad =np.array(transform_utils.get_rpy_from_quaternion(pykin_result[pykin.eef_name].rot)) #  当前末端姿态 in rad
+        controller.position = np.concatenate((py_ee_pos, py_ee_ori_rpy_rad), axis=0) # 6*1
+
+        # 根据规划的路径获取旧的末端期望位姿
+        desired_position = p_end_array[i, :]
+
+        # 将传感器坐标系下的力转换到基坐标系下，注意此时受力坐标系为传感器坐标系，不是末端坐标系
+        py_ee_transmat = np.array(transform_utils.get_matrix_from_quaternion(pykin_result[pykin.eef_name].rot)) # 3*3 末端姿态矩阵
+        contact_force = py_ee_transmat @ calib_force_data[:3] # 末端受到的外部力转换到基坐标系下
+        contact_troque = py_ee_transmat @ calib_force_data[3:] # 末端受到的外部力矩转换到基坐标系下
+        contact_force_data = np.concatenate((contact_force, contact_troque), axis=0) # 6*1
+
+        # 通过导纳控制器计算新的末端期望位姿
+        updated_position = controller.update(desired_position, desired_velocity, contact_force_data)
+
+        # 设置期望位置、速度和加速度
+        q_target = robot_inverse_kinematic(updated_position[:3],updated_position[3:])
+        v_target = np.zeros(num_joints)  # Assume target velocities are zero
+        a_target = np.zeros(num_joints)  # Assume target accelerations are zero
+
+        # 生成平滑轨迹
+        positions, velocities, accelerations = generate_trajectory(
+            current_angles, current_velocities, current_accelerations,
+            q_target, v_target, a_target,
+            control_period, lookahead_time
+        )
+
+        # 计算消耗时间=轨迹规划时间+逆运动学求解时间
+        elapsed_time = time.time()-st_time
+
+        # 保存当前周期的关节状态
+        prev_angles = current_angles
+        prev_velocities = current_velocities
+
+        # 直接can协议透传目标位置
+        if flag_enter_tco2canbus:
+            if i != num_points - 1: # 不是最后一条轨迹
+                robot.set_waypoint_to_canbus(tuple(positions[1,:])) # in rad
+                all_positions_desired.append(positions[1,:])
+            else:  # 最后一条轨迹
+                for j in range(len(positions)):
+                    robot.set_waypoint_to_canbus(tuple(positions[j,:]))
+                    time.sleep(control_period)
+                all_positions_desired.append(positions)
+                break
+        else:
+            continue
+        
+        # 时间补偿, 保证控制周期为0.01s
+        if elapsed_time > control_period:
+            pass
+        else:
+            time.sleep(control_period - elapsed_time)
+
+    # 将 all_positions_desired 中的 NumPy 数组转换为 Python 列表
+    all_positions_converted_desired = [pos.tolist() for pos in all_positions_desired]
+    all_positions_real_converted = [pos.tolist() for pos in all_positions_real]
+
+    with open('trajectory_data.json', 'w') as f:
+        json.dump(all_positions_converted_desired, f)
+    
+    with open('trajectory_data_real.json', 'w') as f:
+        json.dump(all_positions_real_converted, f)
+
+
+    # # 退出 TCP 转 CAN 透传模式
+    robot.leave_tcp2canbus_mode()
+    print('退出 TCP 转 CAN 透传模式')
+
+    return None
+
 
 if __name__ == '__main__':
  
@@ -269,6 +479,7 @@ if __name__ == '__main__':
     force_data_list = [] # 记录每次读取的力数据
     pose_data_list = [] # 记录每次读取的末端位姿
     joint_data_list = [] # 记录每次读取的关节角度
+    p_end_list = [] # 记录每次规划的末端位置
     time_list = [] # 记录每次读取的时间
     running = True # 线程运行标志
     G_force = np.zeros(6) # Gx Gy Gz Mgx Mgy Mgz 负载重力在力传感器坐标系下的分量
@@ -281,225 +492,21 @@ if __name__ == '__main__':
     read_thread.start()
     logger.info("等待读取外部力数据线程启动")
 
+    # # 初始化ROS节点
+    # rospy.init_node('subscribe_joint_state', anonymous=True)
+
     '''
     主程序
     '''
     try:
-        # 控制主程序
+
+        main_controller() # 主控制程序
         
-        # 设置碰撞等级
-        robot.set_collision_class(6)
-        # 初始化全局配置文件 自动清理掉之前设置的用户坐标系，速度，加速度等属性
-        robot.init_profile() 
-
-        # 设置关节最大加速度 rad/s^2
-        robot.set_joint_maxacc((1.0, 1.0, 1.0, 1.0, 1.0, 1.0)) 
-        # 设置关节最大速度 rad/s
-        robot.set_joint_maxvelc((1.0, 1.0, 1.0, 1.0, 1.0, 1.0))
-        # 设置末端运动最大线加速度 m/s^2
-        line_maxacc = 0.5
-        robot.set_end_max_line_acc(line_maxacc)
-        # 设置末端运动最大线速度 m/s
-        line_maxvelc = 0.3
-        robot.set_end_max_line_velc(line_maxvelc)
-
-        # robot.move_joint(tuple([1.5756, -0.0999, -1.7131, 1.5337, 1.6265, 3.0839]))
-
-        '''
-        获取当前末端位姿
-        '''
-        current_waypoint = robot.get_current_waypoint()
-        current_joint_rad = np.round(np.array(current_waypoint['joint']),4) # in rad
-        ee_pos = np.array([np.round(i,4) for i in current_waypoint['pos']]) # 当前末端位置 in m
-        ee_ori_quater = np.round(np.array(current_waypoint['ori']),4) # 当前末端姿态 in quaternion
-        ee_ori_rpy_rad = np.round(np.array(robot.quaternion_to_rpy(ee_ori_quater)),4) # # 当前末端姿态 in rad
-        ee_ori_rpy_deg = np.round(ee_ori_rpy_rad/np.pi*180,2) # # 当前末端姿态 in degree
-
-
-        '''
-        模拟圆弧轨迹规划
-        '''
-        radius = 0.06  # 圆的半径
-        p_start = ee_pos.copy() # 起点位置
-        p_center = ee_pos.copy() # 圆心位置为起点
-        p_start[0] = p_start[0] + radius # 移动到最高点
-
-        desired_joint = robot_inverse_kinematic(p_start,ee_ori_rpy_rad) # 末端期望位置 / m， 角度rqy / rad
-        print('desired_joint: ', [r_qd/np.pi*180 for r_qd in desired_joint])
-        robot.move_joint(desired_joint)
-        time.sleep(1)
-        
-        '''
-        进入 TCP 转 CAN 透传模式
-        '''
-        flag_enter_tco2canbus = False
-        result = robot.enter_tcp2canbus_mode()
-        if result != RobotErrorType.RobotError_SUCC:
-            logger.info("TCP 转 CAN 透传模式失败, 错误码：{}".format(result))
-        else:
-            logger.info("TCP 转 CAN 透传模式成功")
-            flag_enter_tco2canbus = True
-
-        # 画出圆轨迹散点图
-        fig = plt.figure()
-        ax = fig.add_subplot(111, projection='3d')
-
-        '''
-        先进行路径规划, 规划每一个目标点的位姿
-        '''
-        # 计算圆轨迹上的点
-        num_points = 4000  # 圆轨迹上的点数
-        angles = np.linspace(0, 2 * np.pi, num_points)
-        p_end_list = []
-
-        for angle in angles:
-
-            x = p_center[0] + radius * np.cos(angle)
-            y = p_center[1]
-            z = p_center[2] + radius * np.sin(angle)
-            rx = ee_ori_rpy_rad[0]
-            ry = ee_ori_rpy_rad[1]
-            rz = ee_ori_rpy_rad[2]
-            p_end = np.array([x, y, z, rx, ry, rz])
-            p_end_list.append(p_end)
-            
-            # 在三维坐标系中绘制点
-            ax.scatter(x, y, z, color='r')
-
-        p_end_array = np.array(p_end_list)
-        num_points = p_end_array.shape[0] # 轨迹上点的数量
-
-        '''
-        设置servoj轨迹规划参数
-        '''
-        # initialize control parameters
-        control_period = 0.03  # Control period (s)
-        lookahead_time = 0.2  # Lookahead time (s)
-        num_joints = 6  # Number of joints
-
-        # initialize trajectory data
-        current_angles = np.zeros(num_joints) # [0, 0, 0, 0, 0, 0]
-        current_velocities = np.zeros(num_joints) # [0, 0, 0, 0, 0, 0]
-        current_accelerations = np.zeros(num_joints) # [0, 0, 0, 0, 0, 0]
-
-        prev_velocities = np.zeros(num_joints)
-
-        # initialize whole trajectory data
-        all_positions_desired = []
-        all_positions_real = []
-
-        current_waypoint = robot.get_current_waypoint()
-        prev_angles = np.array(current_waypoint['joint']) # in rad
-        
-        '''
-        设置admittance control阻抗控制器参数
-        '''
-        # 定义质量、刚度和阻尼比
-        mass = [30.0, 30.0, 30.0, 1.0, 1.0, 1.0]  # 惯性参数
-        stiffness = [100.0, 100.0, 100.0, 20.0, 20.0, 20.0]  # 刚度参数
-        damping_ratio = 0.9  # 阻尼比（ξ）
-        dt = control_period # 阻抗控制周期（单位：秒）
-
-        # 初始化导纳参数
-        controller = AdmittanceController(mass, stiffness, damping_ratio, dt)
-
-        # 期望六维位置和速度
-        desired_position = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-        desired_velocity = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-
-        '''
-        开始规划期望轨迹并跟踪
-        '''
-        force_data_zero()
-
-        for i in range(num_points):
-
-            st_time = time.time()
-            
-            # 获取当前关节角度
-            current_waypoint = robot.get_current_waypoint()
-            current_angles = np.array(current_waypoint['joint']) # in rad 
-            all_positions_real.append(current_angles) # in rad
-            
-            # 差分计算当前关节角速度和角加速度
-            current_velocities = (current_angles - prev_angles) / control_period
-            current_accelerations = (current_velocities - prev_velocities) / control_period
-
-            # 获取当前末端位置和姿态
-            pykin_result = pykin.forward_kin(current_angles)
-            py_ee_pos = np.array(pykin_result[pykin.eef_name].pos) # 当前末端位置 in m    
-            py_ee_ori_rpy_rad =np.array(transform_utils.get_rpy_from_quaternion(pykin_result[pykin.eef_name].rot)) #  当前末端姿态 in rad
-            controller.position = np.concatenate((py_ee_pos, py_ee_ori_rpy_rad), axis=0) # 6*1
-
-            # 根据规划的路径获取旧的末端期望位姿
-            desired_position = p_end_array[i, :]
-
-            # 通过导纳控制器计算新的末端期望位姿
-            updated_position = controller.update(desired_position, desired_velocity, calib_force_data)
-
-            # 设置期望位置、速度和加速度
-            q_target = robot_inverse_kinematic(updated_position[:3],updated_position[3:])
-            v_target = np.zeros(num_joints)  # Assume target velocities are zero
-            a_target = np.zeros(num_joints)  # Assume target accelerations are zero
-
-            # 生成平滑轨迹
-            positions, velocities, accelerations = generate_trajectory(
-                current_angles, current_velocities, current_accelerations,
-                q_target, v_target, a_target,
-                control_period, lookahead_time
-            )
-
-            # 计算消耗时间=轨迹规划时间+逆运动学求解时间
-            elapsed_time = time.time()-st_time
-
-            # 保存当前周期的关节状态
-            prev_angles = current_angles
-            prev_velocities = current_velocities
-
-            # 直接can协议透传目标位置
-            if flag_enter_tco2canbus:
-                if i != num_points - 1: # 不是最后一条轨迹
-                    robot.set_waypoint_to_canbus(tuple(positions[1,:])) # in rad
-                    all_positions_desired.append(positions[1,:])
-                else:  # 最后一条轨迹
-                    for j in range(len(positions)):
-                        robot.set_waypoint_to_canbus(tuple(positions[j,:]))
-                        time.sleep(control_period)
-                    all_positions_desired.append(positions)
-            else:
-                continue
-            
-            # 时间补偿, 保证控制周期为0.01s
-            if elapsed_time > control_period:
-                pass
-            else:
-                time.sleep(control_period - elapsed_time)
-
-        # 设置三维图形的标签
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        ax.set_title('Circular Trajectory')
-
-        # 将 all_positions_desired 中的 NumPy 数组转换为 Python 列表
-        all_positions_converted_desired = [pos.tolist() for pos in all_positions_desired]
-        all_positions_real_converted = [pos.tolist() for pos in all_positions_real]
-
-        with open('trajectory_data.json', 'w') as f:
-            json.dump(all_positions_converted_desired, f)
-        
-        with open('trajectory_data_real.json', 'w') as f:
-            json.dump(all_positions_real_converted, f)
-
-
-        # # 退出 TCP 转 CAN 透传模式
-        robot.leave_tcp2canbus_mode()
-
     except KeyboardInterrupt: # CTRL+C退出程序
 
         logger.info("程序被中断")
 
-    except Exception as e:
+    except Exception as e: # 其他异常
 
         logger.info("程序异常退出: ", e)
 
@@ -596,54 +603,22 @@ if __name__ == '__main__':
                 ax4.set_ylim(np.min(pose_data[:, 3:]) - 10, np.max(pose_data[:, 3:]) + 10)
 
         plt.tight_layout()
+
+        # 创建一个三维图形
+        fig3 = plt.figure()
+        ax = fig3.add_subplot(111, projection='3d')
+        p_end_array = np.array(p_end_list)
+
+        # 绘制末端实际位置的三维轨迹（蓝色）
+        ax.plot(pose_data[:, 0], pose_data[:, 1], pose_data[:, 2], color='b', label='End Effector Position')
+        # 绘制末端期望位置的三维轨迹（红色）
+        ax.plot(p_end_array[:, 0], p_end_array[:, 1], p_end_array[:, 2], color='r', label='Desired End Effector Position')
+        
+        # 设置三维图形的标签
+        ax.set_xlabel('X Position (m)')
+        ax.set_ylabel('Y Position (m)')
+        ax.set_zlabel('Z Position (m)')
+        ax.set_title('End Effector Position Trajectory')
+        ax.legend()
         plt.show()
-
-
-        '''# 画关节角度随时间变化的图
-        fig3, axes = plt.subplots(6, 1, figsize=(10, 15))
-        joint_data = np.array(joint_data_list)  # 转换为numpy数组
-        times = np.arange(joint_data.shape[0])  # 转换为相对时间
-
-        joint_labels = ['Joint 1', 'Joint 2', 'Joint 3', 'Joint 4', 'Joint 5', 'Joint 6']
-        for i, ax in enumerate(axes):
-            ax.plot(times, joint_data[:, i], label=joint_labels[i])
-            ax.set_xlabel('Time (s)')
-            ax.set_ylabel('Angle (rad)')
-            ax.legend()
-            ax.grid(True)
-
-        plt.tight_layout()
-
-        # 计算关节速度
-        joint_velocity = np.diff(joint_data, axis=0)
-        velocity_times = times[:-1]  # 速度时间序列比角度时间序列少一个点
-
-        # 画关节速度随时间变化的图
-        fig4, axes_vel = plt.subplots(6, 1, figsize=(10, 15))
-
-        for i, ax in enumerate(axes_vel):
-            ax.plot(velocity_times, joint_velocity[:, i], label=f'{joint_labels[i]} Velocity')
-            ax.set_xlabel('Time (s)')
-            ax.set_ylabel('Velocity (rad/s)')
-            ax.legend()
-            ax.grid(True)
-
-        plt.tight_layout()
-
-        # 计算关节加速度
-        joint_acceleration = np.diff(joint_velocity, axis=0)
-        acceleration_times = velocity_times[:-1]  # 加速度时间序列比速度时间序列少一个点
-
-        # 画关节加速度随时间变化的图
-        fig5, axes_acc = plt.subplots(6, 1, figsize=(10, 15))
-
-        for i, ax in enumerate(axes_acc):
-            ax.plot(acceleration_times, joint_acceleration[:, i], label=f'{joint_labels[i]} Acceleration')
-            ax.set_xlabel('Time (s)')
-            ax.set_ylabel('Acceleration (rad/s^2)')
-            ax.legend()
-            ax.grid(True)
-
-        plt.tight_layout()
-        plt.show()'''
 
