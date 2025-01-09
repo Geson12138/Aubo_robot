@@ -131,16 +131,16 @@ def calib_force_data_func(robot):
         force_zero = np.array(json_data['force_zero'])
 
     # 初始化一个队列用于存储前5次的力传感器数据
-    length_force_data_queue = 10
+    length_force_data_queue = 20
     force_data_queue = deque(maxlen=length_force_data_queue)
 
     # 定义滤波器参数
-    cutoff = 4  # 截止频率 (Hz)
+    cutoff = 3  # 截止频率 (Hz)
     order = 2    # 滤波器阶数
     fs = 200  # 根据实际情况设置采样频率 (Hz)
     b, a = butter(order, cutoff / (0.5 * fs), btype='low', analog=False) # 设计低通Butterworth滤波器
 
-    alpha = 0.9 # 滑动窗口加权滤波
+    alpha = 0.1 # 滑动窗口加权滤波
     smoothed_force_data = np.zeros(6) # 平滑后的力传感器数据
     time_count = 0
 
@@ -200,12 +200,12 @@ def calib_force_data_func(robot):
             # if time_count % 10 == 0:
             #     logger.info("calib_force_data: {}\n".format(calib_force_data[1]))
 
-            time.sleep(0.0001) # 5ms/次
+            time.sleep(0.005) # 5ms/次
         
         else :
 
             logger.info("force_data is None, 没有收到原始力传感器数据")
-            time.sleep(0.0001)
+            time.sleep(0.005)
 
 
 def force_data_zero():
@@ -318,31 +318,35 @@ def generate_trajectory(q_start, v_start, a_start, q_end, v_end, a_end, move_per
 
     return positions, velocities, accelerations
 
-def trapezoidal_velocity_corrected(theta_start, theta_end, acc_time, dcc_time, control_period, joint_vel_limit):
+def trapezoidal_velocity_corrected(theta_start, theta_end, acc_time, dcc_time, control_period, joint_vel_limit,prev_vel, prev_acc, max_delta_vel):
     """
     梯形速度规划，带有最大角速度和最大角加速度约束，支持多个关节
-    param theta_start: 起始关节角度
-    param theta_end: 目标关节角度
-    param acc_time: 加速时间
-    param dcc_time: 减速时间
-    param control_period: 控制周期
-    param joint_vel_limit: 关节最大角速度
-    param joint_acc_limit: 关节最大角加速度
-    return: 规划的时间、角度和速度
     """
     num_joints = len(theta_start)
     theta_total = np.array(theta_end) - np.array(theta_start)
-    direction = np.sign(theta_total)
+    direction_vel = np.sign(theta_total)
     
+    lookahead_time = acc_time + dcc_time + np.max(np.abs(theta_total) / joint_vel_limit)  # 确保lookahead_time为标量
     t2 = lookahead_time - (acc_time + dcc_time)
     
-    vel_max_theoretical = np.abs(theta_total) / ((acc_time / 2) + np.maximum(t2, 0) + (dcc_time / 2))
-    vel_max_theoretical = np.minimum(vel_max_theoretical, joint_vel_limit)
-    acc_max_theoretical = vel_max_theoretical / acc_time
+    # 计算最大速度（受限于最大角速度）
+    vel_max = np.abs(theta_total) / ((acc_time / 2) + max(t2, 0) + (dcc_time / 2))
+    vel_max = np.minimum(vel_max, joint_vel_limit) * direction_vel
     
-    vel_max_theoretical *= direction
-    acc_max_theoretical *= direction
-
+    # 计算最大加速度基于前后速度，并考虑方向，取绝对值后比较
+    vel_total = (np.array(vel_max) - np.array(prev_vel)) / acc_time
+    direction_acc = np.sign(vel_total)
+    acc_max = np.minimum(np.abs(vel_total), max_delta_vel) * direction_acc
+    
+    # 平滑加速度
+    alpha = 0.1  # 指数平滑因子（调整以减少振荡）
+    if prev_acc is not None:
+        acc_max = alpha * acc_max + (1 - alpha) * prev_acc
+    
+    # 计算平滑后的速度
+    vel_max = prev_vel + acc_max * acc_time
+    
+    # 生成轨迹时间序列
     t_vals = np.arange(0, lookahead_time + control_period, control_period)
     vel_vals = np.zeros((num_joints, len(t_vals)))
     theta_vals = np.zeros((num_joints, len(t_vals)))
@@ -351,11 +355,12 @@ def trapezoidal_velocity_corrected(theta_start, theta_end, acc_time, dcc_time, c
         theta = theta_start[j]
         for i, t in enumerate(t_vals):
             if t < acc_time:
-                vel = acc_max_theoretical[j] * t
+                vel = prev_vel[j] + acc_max[j] * t
             elif t < acc_time + t2:
-                vel = vel_max_theoretical[j]
+                vel = vel_max[j]
             else:
-                vel = vel_max_theoretical[j] - acc_max_theoretical[j] * (t - acc_time - t2)
+                vel = vel_max[j] - acc_max[j] * (t - acc_time - t2)
+            
             if i > 0:
                 theta += (vel + vel_vals[j, i-1]) / 2 * control_period
             theta_vals[j, i] = theta
@@ -371,10 +376,10 @@ def admittance_controller():
     global flag_enter_tco2canbus, calib_force_data
 
     # 设置admittance control阻抗控制器参数
-    mass = [10.0, 10.0, 10.0, 5.0, 5.0, 5.0]  # 定义惯性参数
-    damping = [30.0, 30.0, 30.0, 5.0, 5.0, 5.0]  # 定义阻尼参数
-    stiffness = [100.0, 100.0, 100.0, 10.0, 10.0, 10.0]  # 定义刚度参数
-    control_period = 0.035 # 阻抗控制周期（单位：秒）要跟状态反馈时间保持一致，用于外环阻抗控制循环
+    mass = [10.0, 10.0, 10.0, 2.0, 2.0, 2.0]  # 定义惯性参数
+    damping = [30.0, 30.0, 30.0, 10.0, 10.0, 10.0]  # 定义阻尼参数
+    stiffness = [10.0, 10.0, 10.0, 5.0, 5.0, 5.0]  # 定义刚度参数
+    control_period = 0.040 # 阻抗控制周期（单位：秒）要跟状态反馈时间保持一致，用于外环阻抗控制循环
 
     # 初始化导纳参数
     controller = AdmittanceController(mass, stiffness, damping, control_period)
@@ -393,14 +398,14 @@ def admittance_controller():
     # 模拟直线路径
     trans_length = 0.05  # 平移距离
     p_start = ee_pos.copy() # 起点位置
-    p_start[0] = p_start[0] + trans_length # 移动到最左端
+    # p_start[0] = p_start[0] + trans_length # 移动到最左端
 
-    desired_joint = robot_inverse_kinematic(p_start,ee_ori_rpy_rad) # 末端期望位置 / m， 角度rqy / rad
-    robot.move_joint(desired_joint)
-    time.sleep(2)
+    # desired_joint = robot_inverse_kinematic(p_start,ee_ori_rpy_rad) # 末端期望位置 / m， 角度rqy / rad
+    # robot.move_joint(desired_joint)
+    # time.sleep(2)
 
     # 先进行路径规划, 规划每一个目标点的位姿
-    num_points = 2000  # 轨迹上的点数
+    num_points = 1000  # 轨迹上的点数
     delta_steps = np.linspace(0, trans_length, num_points) # 向右平移
 
     for delta_step in delta_steps:
@@ -420,8 +425,10 @@ def admittance_controller():
     # 梯形速度轨迹规划参数
     acc_time = 1 * control_period  # 加速时间 (s)
     dcc_time = 1 * control_period  # 减速时间 (s)
-    joint_vel_limit = [0.03] * 6  # 每个关节的最大角速度 (rad/s)
-    joint_acc_limit = [v / acc_time for v in joint_vel_limit]  # 计算最大角加速度
+    joint_vel_limit = np.ones(6) * 0.03  # 每个关节的最大角速度 (rad/s)
+    joint_acc_limit = np.ones(6) * 0.05  # 计算最大角加速度
+    prev_joint_vel = np.zeros(6) # 保存上一周期周期的关节速度
+    prev_joint_acc = np.zeros(6) # 保存上一周期周期的关节加速度
 
     # 进入 TCP 转 CAN 透传模式
     result = robot.enter_tcp2canbus_mode()
@@ -435,10 +442,6 @@ def admittance_controller():
     force_data_zero()
 
     logger.info("进入外环导纳控制周期，控制周期{}ms".format(control_period*1000))
-
-    # current_waypoint = robot.get_current_waypoint()
-    # pre_joint = np.array(current_waypoint['joint']) # in rad 
-    # pre_joint_vel = np.zeros(6) # in rad/s
     
     for i in range(num_points):
 
@@ -452,8 +455,6 @@ def admittance_controller():
         ee_ori_rpy_rad = np.array(robot.quaternion_to_rpy(ee_ori_quater)) # # 当前末端姿态 in rad
 
         # # 等待并获取最新的 joint_angles 话题消息
-        # joint_msg = rospy.wait_for_message('joint_angles', Float64MultiArray)
-        # cur_joint = np.array(joint_msg.data) # in rad
         all_positions_real.append(cur_joint) # in rad
 
         # 获取当前末端位置和姿态
@@ -468,19 +469,14 @@ def admittance_controller():
         contact_troque = py_ee_transmat @ calib_force_data[3:] # 末端受到的外部力矩转换到基坐标系下
         contact_force_data = np.concatenate((contact_force, contact_troque), axis=0) # 6*1
 
+        contact_force_data = contact_force_data + np.array([-10.0, 0.0, 0.0, 0.0, 0.0, 0.0]) # 加上重力补偿
+
         # 通过导纳控制器计算新的末端期望位姿
-        # logger.info("contact_force_data: {}".format(contact_force_data[2]))
         updated_eef_pose = controller.update(des_eef_pose, des_eef_vel, contact_force_data)
         # updated_eef_pose = des_eef_pose.copy()
 
         # 设置期望位置、速度和加速度
         q_target = robot_inverse_kinematic(updated_eef_pose[:3],updated_eef_pose[3:])
-        # v_target = np.zeros(num_joints)  # Assume target velocities are zero
-        # a_target = np.zeros(num_joints)  # Assume target accelerations are zero
-
-        # # 差分计算当前关节速度和加速度
-        # cur_joint_vel = (cur_joint - pre_joint) / control_period # in rad/s
-        # cur_joint_acc = (cur_joint_vel - pre_joint_vel) / control_period # in rad/s^2
 
         # # 5次多项式轨迹规划生成平滑轨迹
         # positions, velocities, accelerations = generate_trajectory(
@@ -490,14 +486,14 @@ def admittance_controller():
         # )
 
         # 梯形速度规划生成平滑轨迹
-        _, positions,_ = trapezoidal_velocity_corrected(cur_joint, q_target, acc_time, dcc_time, control_period, joint_vel_limit)
+        _, positions, velocities = trapezoidal_velocity_corrected(cur_joint, q_target, acc_time, dcc_time, control_period, joint_vel_limit, prev_joint_vel, prev_joint_acc, joint_acc_limit)
 
         # 将规划好的轨迹放进共享队列
         trajectory_queue.put(positions)
-
-        # # 更新前一个关节角度和关节角速度
-        # pre_joint = cur_joint.copy()
-        # pre_joint_vel = cur_joint_vel.copy()
+        
+        prev_joint_acc = (velocities[:,1] - prev_joint_vel) / control_period # 保存当前周期的关节加速度
+        prev_joint_vel = velocities[:,1]
+        all_positions_velocity.append(prev_joint_vel) # 保存期望关节速度
         
         # 时间补偿, 保证控制周期为control_period
         elapsed_time = time.time()-st_time # 计算消耗时间=轨迹规划时间+逆运动学求解时间
@@ -515,7 +511,7 @@ def admittance_controller():
 
 def servo_j():
     '''
-    机械臂内环位置控制, 控制周期ms
+    机械臂内环位置控制, 控制周期40ms
     '''
 
     global flag_enter_tco2canbus
@@ -626,7 +622,7 @@ if __name__ == '__main__':
 
     # ===================设置 servo_j 内环位置控制参数===============
     trajectory_queue = queue.Queue() # 初始化轨迹队列
-    move_period = 0.035  # 内环控制周期 
+    move_period = 0.040 # 内环控制周期 
     lookahead_time = 0.2  # Lookahead time (s) 前瞻时间，用0.2s规划轨迹
     num_joints = 6  # Number of joints
     cur_joint = np.zeros(num_joints) # 当前关节角 [0, 0, 0, 0, 0, 0]
@@ -637,6 +633,7 @@ if __name__ == '__main__':
     # 记录整段轨迹的期望关节角度和实际关节角度    
     all_positions_desired = []
     all_positions_real = []
+    all_positions_velocity = []
     # ======================================================
 
     # ==========================主程序=========================
@@ -686,12 +683,16 @@ if __name__ == '__main__':
         # 将 all_positions_desired 中的 NumPy 数组转换为 Python 列表
         all_positions_converted_desired = [pos.tolist() for pos in all_positions_desired]
         all_positions_real_converted = [pos.tolist() for pos in all_positions_real]
+        all_positions_velocity_converted = [pos.tolist() for pos in all_positions_velocity]
 
         with open('trajectory_data.json', 'w') as f:
             json.dump(all_positions_converted_desired, f)
         
         with open('trajectory_data_real.json', 'w') as f:
             json.dump(all_positions_real_converted, f)
+        
+        with open('trajectory_velocity_real.json', 'w') as f:
+            json.dump(all_positions_velocity_converted, f)
 
         # 画图
         max_time = np.round(max(time_list)+1).astype(int)
@@ -783,4 +784,3 @@ if __name__ == '__main__':
         ax.legend()
         plt.savefig('end_effector_position_trajectory.png')
         plt.show()
-
