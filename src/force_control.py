@@ -19,10 +19,15 @@ from scipy.interpolate import CubicSpline
 import rospy
 from std_msgs.msg import Float64MultiArray
 import queue
+import concurrent.futures
 
 
 # 创建一个logger
 logger = logging.getLogger('calibration_forceSensor')
+
+# 清除上一次的logger
+if logger.hasHandlers():
+    logger.handlers.clear()
 
 def logger_init():
     
@@ -46,16 +51,77 @@ def logger_init():
 
 
 
+
 # 定义报文头和尾
 PACK_BEGIN = "<PACK_BEGIN"
 PACK_END = "PACK_END>"
+force_data = np.zeros(6) # fx fy fz Mx My Mz 原始力传感器数据
 calib_force_data = np.zeros(6) # 标定后的力数据
 force_zero_point = np.zeros(6) # 力传感器数据清零
+# 线程池
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
 
-def read_force_data(sock, robot):
+def process_data(packet):
+    """
+    解析和处理接收到的单个数据包
+    """
+    global force_data
+    try:
+        # 从数据包中解析 JSON 数据
+        packet_content = packet[len(PACK_BEGIN): -len(PACK_END)]
+        length_str = packet_content[:8].strip()
+        length = int(length_str)
+        json_data = packet_content[8:8 + length]
+        json_obj = json.loads(json_data)
+        
+        # 更新全局力传感器数据
+        force_data = json_obj["force_data"]
+        # logger.info(f"解析成功: {force_data[1]}")
+    
+    except (ValueError, json.JSONDecodeError) as e:
+        logger.error(f"数据解析失败: {e}")
+
+def read_force_data(sock):
+    """
+    从 socket 读取数据
+    """
+    buffer = b""
+    global read_force_data_running
+
+    while read_force_data_running:
+        try:
+            data = sock.recv(4096)  # 接收数据
+            if not data:
+                break
+            
+            buffer += data
+            # 检查数据包是否完整
+            begin_pos = buffer.find(PACK_BEGIN.encode())
+            end_pos = buffer.find(PACK_END.encode())
+            
+            while begin_pos >= 0 and end_pos >= 0 and end_pos > begin_pos + len(PACK_BEGIN):
+                # 提取完整数据包
+                packet = buffer[begin_pos:end_pos + len(PACK_END)]
+                # 提交数据包给线程池进行解析和处理
+                executor.submit(process_data, packet.decode())
+                
+                # 移动缓冲区指针
+                buffer = buffer[end_pos + len(PACK_END):]
+                begin_pos = buffer.find(PACK_BEGIN.encode())
+                end_pos = buffer.find(PACK_END.encode())
+        
+        except Exception as e:
+            logger.error(f"读取数据时发生错误: {e}")
+            break
+    
+
+def calib_force_data_func(robot):
     '''
-    读取原始力传感器数据，并输出负载辨识和标定后的纯外力数据 5ms/次
+    校准力传感器数据, 输出负载辨识和标定后的纯外力数据
     '''
+
+    global calib_force_data,read_force_data_running, force_data, force_zero_point
+
     # 读取 calibration_result.JSON 文件得到标定结果
     file_name = './calibrate_forceSensor/calibration_result.json'
     with open(file_name, 'r') as json_file:
@@ -63,11 +129,6 @@ def read_force_data(sock, robot):
         gravity_bias = np.array(json_data['gravity_bias'])
         mass = np.array(json_data['mass'][0])
         force_zero = np.array(json_data['force_zero'])
-
-    buffer = b""
-    start_time = time.time()
-
-    global read_data_running, force_zero_point, calib_force_data
 
     # 初始化一个队列用于存储前5次的力传感器数据
     length_force_data_queue = 10
@@ -79,38 +140,13 @@ def read_force_data(sock, robot):
     fs = 200  # 根据实际情况设置采样频率 (Hz)
     b, a = butter(order, cutoff / (0.5 * fs), btype='low', analog=False) # 设计低通Butterworth滤波器
 
-    alpha = 0.8 # 滑动窗口加权滤波
+    alpha = 0.9 # 滑动窗口加权滤波
     smoothed_force_data = np.zeros(6) # 平滑后的力传感器数据
+    time_count = 0
+
+    start_time = time.time()
     
-    while read_data_running:
-
-        data = sock.recv(4096)
-        if not data:
-            return None
-
-        buffer += data
-        begin_pos = buffer.find(PACK_BEGIN.encode())
-        end_pos = buffer.find(PACK_END.encode())
-        
-        if begin_pos >= 0 and end_pos >= 0 and end_pos > begin_pos + len(PACK_BEGIN.encode()):
-
-            packet = buffer[begin_pos:end_pos + len(PACK_END.encode())]
-            packet_content = packet[len(PACK_BEGIN.encode()):-len(PACK_END.encode())]
-            length_str = packet_content[:8].decode().strip()
-            length = int(length_str)
-            json_data = packet_content[8:8+length].decode()
-            
-            try:
-
-                json_obj = json.loads(json_data)
-                force_data = json_obj["force_data"] # fx fy fz Mx My Mz 力传感器数据
-                buffer = buffer[end_pos + len(PACK_END.encode()):]
-                
-            except json.JSONDecodeError as e:
-
-                logger.info("JSON解析错误:", e)
-                buffer = buffer[end_pos + len(PACK_END.encode()):]
-                force_data = None
+    while read_force_data_running:
         
         if force_data is not None:
             
@@ -134,9 +170,9 @@ def read_force_data(sock, robot):
             '''
             current_waypoint = robot.get_current_waypoint()
             # 当前末端位置 in m
-            ee_pos = [np.round(i,4) for i in current_waypoint['pos']] 
+            ee_pos = [np.round(i,6) for i in current_waypoint['pos']] 
             # 当前末端姿态
-            ee_ori_rpy_rad = np.round(np.array(robot.quaternion_to_rpy(current_waypoint['ori'])),4) # in rad
+            ee_ori_rpy_rad = np.round(np.array(robot.quaternion_to_rpy(current_waypoint['ori'])),6) # in rad
             ee_ori_rpy_deg = np.round(ee_ori_rpy_rad/np.pi*180,2) # in degree
             pose_data = np.concatenate((ee_pos, ee_ori_rpy_deg), axis=0) # 6*1
 
@@ -159,8 +195,18 @@ def read_force_data(sock, robot):
             force_data_list.append(calib_force_data) # 末端受到的外部力
             pose_data_list.append(pose_data) # 末端位置和姿态
             time_list.append(time.time() - start_time) # 时间
+            
+            # time_count += 1
+            # if time_count % 10 == 0:
+            #     logger.info("calib_force_data: {}\n".format(calib_force_data[1]))
 
-            time.sleep(0.004) # 5ms/次
+            time.sleep(0.0001) # 5ms/次
+        
+        else :
+
+            logger.info("force_data is None, 没有收到原始力传感器数据")
+            time.sleep(0.0001)
+
 
 def force_data_zero():
     '''
@@ -272,27 +318,70 @@ def generate_trajectory(q_start, v_start, a_start, q_end, v_end, a_end, move_per
 
     return positions, velocities, accelerations
 
+def trapezoidal_velocity_corrected(theta_start, theta_end, acc_time, dcc_time, control_period, joint_vel_limit):
+    """
+    梯形速度规划，带有最大角速度和最大角加速度约束，支持多个关节
+    param theta_start: 起始关节角度
+    param theta_end: 目标关节角度
+    param acc_time: 加速时间
+    param dcc_time: 减速时间
+    param control_period: 控制周期
+    param joint_vel_limit: 关节最大角速度
+    param joint_acc_limit: 关节最大角加速度
+    return: 规划的时间、角度和速度
+    """
+    num_joints = len(theta_start)
+    theta_total = np.array(theta_end) - np.array(theta_start)
+    direction = np.sign(theta_total)
+    
+    t2 = lookahead_time - (acc_time + dcc_time)
+    
+    vel_max_theoretical = np.abs(theta_total) / ((acc_time / 2) + np.maximum(t2, 0) + (dcc_time / 2))
+    vel_max_theoretical = np.minimum(vel_max_theoretical, joint_vel_limit)
+    acc_max_theoretical = vel_max_theoretical / acc_time
+    
+    vel_max_theoretical *= direction
+    acc_max_theoretical *= direction
+
+    t_vals = np.arange(0, lookahead_time + control_period, control_period)
+    vel_vals = np.zeros((num_joints, len(t_vals)))
+    theta_vals = np.zeros((num_joints, len(t_vals)))
+    
+    for j in range(num_joints):
+        theta = theta_start[j]
+        for i, t in enumerate(t_vals):
+            if t < acc_time:
+                vel = acc_max_theoretical[j] * t
+            elif t < acc_time + t2:
+                vel = vel_max_theoretical[j]
+            else:
+                vel = vel_max_theoretical[j] - acc_max_theoretical[j] * (t - acc_time - t2)
+            if i > 0:
+                theta += (vel + vel_vals[j, i-1]) / 2 * control_period
+            theta_vals[j, i] = theta
+            vel_vals[j, i] = vel
+    
+    return t_vals, theta_vals, vel_vals
+
 def admittance_controller():
     '''
     阻抗控制器, 用于机械臂外环控制, 控制周期25hz
     '''
 
-    global cur_joint,cur_joint_vel,cur_joint_acc,flag_enter_tco2canbus
+    global flag_enter_tco2canbus, calib_force_data
 
     # 设置admittance control阻抗控制器参数
-    mass = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]  # 定义惯性参数
-    stiffness = [5.0, 5.0, 5.0, 5.0, 5.0, 5.0]  # 定义刚度参数
-    damping_ratio = 0.8  # # 定义阻尼比（ξ）
-    control_period = 0.04 # 阻抗控制周期（单位：秒）要跟状态反馈时间保持一致，用于外环阻抗控制循环
+    mass = [10.0, 10.0, 10.0, 5.0, 5.0, 5.0]  # 定义惯性参数
+    damping = [30.0, 30.0, 30.0, 5.0, 5.0, 5.0]  # 定义阻尼参数
+    stiffness = [100.0, 100.0, 100.0, 10.0, 10.0, 10.0]  # 定义刚度参数
+    control_period = 0.035 # 阻抗控制周期（单位：秒）要跟状态反馈时间保持一致，用于外环阻抗控制循环
 
     # 初始化导纳参数
-    controller = AdmittanceController(mass, stiffness, damping_ratio, control_period)
+    controller = AdmittanceController(mass, stiffness, damping, control_period)
 
     # 期望末端位置和速度
     des_eef_pose = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     des_eef_vel = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-
-    # robot.move_joint(tuple([1.5756, -0.0999, -1.7131, 1.5337, 1.6265, 3.0839]))
 
     # 获取当前末端位姿
     current_waypoint = robot.get_current_waypoint()
@@ -301,38 +390,24 @@ def admittance_controller():
     ee_ori_quater = np.round(np.array(current_waypoint['ori']),4) # 当前末端姿态 in quaternion
     ee_ori_rpy_rad = np.round(np.array(robot.quaternion_to_rpy(ee_ori_quater)),4) # # 当前末端姿态 in rad
 
-    # 模拟圆弧轨迹规划
-    radius = 0.06  # 圆的半径
+    # 模拟直线路径
+    trans_length = 0.05  # 平移距离
     p_start = ee_pos.copy() # 起点位置
-    p_center = ee_pos.copy() # 圆心位置为起点
-    # p_start[0] = p_start[0] + radius # 移动到最高点
+    p_start[0] = p_start[0] + trans_length # 移动到最左端
 
     desired_joint = robot_inverse_kinematic(p_start,ee_ori_rpy_rad) # 末端期望位置 / m， 角度rqy / rad
-    print('desired_joint: ', [r_qd/np.pi*180 for r_qd in desired_joint])
     robot.move_joint(desired_joint)
-    time.sleep(1)
-    
-    # 进入 TCP 转 CAN 透传模式
-    result = robot.enter_tcp2canbus_mode()
-    if result != RobotErrorType.RobotError_SUCC:
-        logger.info("TCP 转 CAN 透传模式失败, 错误码：{}".format(result))
-    else:
-        logger.info("TCP 转 CAN 透传模式成功")
-        flag_enter_tco2canbus = True
-
+    time.sleep(2)
 
     # 先进行路径规划, 规划每一个目标点的位姿
-    num_points = 1000  # 圆轨迹上的点数
-    angles = np.linspace(0, 2 * np.pi, num_points) # 计算圆轨迹上的点
+    num_points = 2000  # 轨迹上的点数
+    delta_steps = np.linspace(0, trans_length, num_points) # 向右平移
 
-    for angle in angles:
+    for delta_step in delta_steps:
 
-        # x = p_center[0] + radius * np.cos(angle)
-        # y = p_center[1]
-        # z = p_center[2] + radius * np.sin(angle)
-        x = p_start[0]
+        x = p_start[0] # - delta_step
         y = p_start[1]
-        z = p_start[2]
+        z = p_start[2] 
         rx = ee_ori_rpy_rad[0]
         ry = ee_ori_rpy_rad[1]
         rz = ee_ori_rpy_rad[2]
@@ -342,12 +417,29 @@ def admittance_controller():
     p_end_array = np.array(p_end_list)
     num_points = p_end_array.shape[0] # 轨迹上点的数量
 
-    '''
-    开始规划期望轨迹并跟踪
-    '''
+    # 梯形速度轨迹规划参数
+    acc_time = 1 * control_period  # 加速时间 (s)
+    dcc_time = 1 * control_period  # 减速时间 (s)
+    joint_vel_limit = [0.03] * 6  # 每个关节的最大角速度 (rad/s)
+    joint_acc_limit = [v / acc_time for v in joint_vel_limit]  # 计算最大角加速度
+
+    # 进入 TCP 转 CAN 透传模式
+    result = robot.enter_tcp2canbus_mode()
+    if result != RobotErrorType.RobotError_SUCC:
+        logger.info("TCP 转 CAN 透传模式失败, 错误码：{}".format(result))
+    else:
+        logger.info("TCP 转 CAN 透传模式成功")
+        flag_enter_tco2canbus = True
+
+    # 力传感器数据清零
     force_data_zero()
 
     logger.info("进入外环导纳控制周期，控制周期{}ms".format(control_period*1000))
+
+    # current_waypoint = robot.get_current_waypoint()
+    # pre_joint = np.array(current_waypoint['joint']) # in rad 
+    # pre_joint_vel = np.zeros(6) # in rad/s
+    
     for i in range(num_points):
 
         st_time = time.time()
@@ -377,25 +469,39 @@ def admittance_controller():
         contact_force_data = np.concatenate((contact_force, contact_troque), axis=0) # 6*1
 
         # 通过导纳控制器计算新的末端期望位姿
+        # logger.info("contact_force_data: {}".format(contact_force_data[2]))
         updated_eef_pose = controller.update(des_eef_pose, des_eef_vel, contact_force_data)
+        # updated_eef_pose = des_eef_pose.copy()
 
         # 设置期望位置、速度和加速度
         q_target = robot_inverse_kinematic(updated_eef_pose[:3],updated_eef_pose[3:])
-        v_target = np.zeros(num_joints)  # Assume target velocities are zero
-        a_target = np.zeros(num_joints)  # Assume target accelerations are zero
+        # v_target = np.zeros(num_joints)  # Assume target velocities are zero
+        # a_target = np.zeros(num_joints)  # Assume target accelerations are zero
 
-        # 5次多项式轨迹规划生成平滑轨迹
-        positions, velocities, accelerations = generate_trajectory(
-            cur_joint, cur_joint_vel, cur_joint_acc,
-            q_target, v_target, a_target,
-            move_period, lookahead_time
-        )
+        # # 差分计算当前关节速度和加速度
+        # cur_joint_vel = (cur_joint - pre_joint) / control_period # in rad/s
+        # cur_joint_acc = (cur_joint_vel - pre_joint_vel) / control_period # in rad/s^2
+
+        # # 5次多项式轨迹规划生成平滑轨迹
+        # positions, velocities, accelerations = generate_trajectory(
+        #     cur_joint, cur_joint_vel, cur_joint_acc,
+        #     q_target, v_target, a_target,
+        #     move_period, lookahead_time
+        # )
+
+        # 梯形速度规划生成平滑轨迹
+        _, positions,_ = trapezoidal_velocity_corrected(cur_joint, q_target, acc_time, dcc_time, control_period, joint_vel_limit)
 
         # 将规划好的轨迹放进共享队列
-        trajectory_queue.put((positions,velocities,accelerations))
+        trajectory_queue.put(positions)
+
+        # # 更新前一个关节角度和关节角速度
+        # pre_joint = cur_joint.copy()
+        # pre_joint_vel = cur_joint_vel.copy()
         
         # 时间补偿, 保证控制周期为control_period
         elapsed_time = time.time()-st_time # 计算消耗时间=轨迹规划时间+逆运动学求解时间
+        # print('外环elapsed_time: ', elapsed_time)
         if elapsed_time > control_period:
             pass
         else:
@@ -409,13 +515,13 @@ def admittance_controller():
 
 def servo_j():
     '''
-    机械臂内环位置控制, 控制周期10ms
+    机械臂内环位置控制, 控制周期ms
     '''
 
-    global cur_joint,cur_joint_vel,cur_joint_acc,flag_enter_tco2canbus
+    global flag_enter_tco2canbus
 
-    traj_data = None
-    traj_index = 0
+    traj_data = []
+    traj_index = 1
     traj_len = 0
 
     logger.info("进入内环位置控制周期，控制周期{}ms".format(move_period*1000))
@@ -425,31 +531,25 @@ def servo_j():
         st_time = time.time()
 
         # 获取轨迹的逻辑：当前轨迹为空 or 当前轨迹已经执行完毕 or 轨迹队列中有新的轨迹
-        if traj_data is None or traj_index >= traj_len or not trajectory_queue.empty():
+        if len(traj_data) == 0 or traj_index >= traj_len or not trajectory_queue.empty():
 
             # 从共享队列中获取轨迹数据
             while not trajectory_queue.empty():
                 traj_data = trajectory_queue.get()
-
-            # 获取了新的轨迹数据
-            if traj_data: 
-                positions, velocities, accelerations = traj_data
-                traj_index = 0
+                positions = np.array(traj_data)
+                traj_index = 1
                 traj_len = positions.shape[0]
         
         # 如果没有轨迹，就再等一下
-        if traj_data is None:
+        if len(traj_data) == 0:
             time.sleep(move_period)
             continue
 
         # 直接can协议透传目标位置
         if flag_enter_tco2canbus and traj_index < traj_len:
                     
-            robot.set_waypoint_to_canbus(tuple(positions[traj_index,:])) # 透传目标位置给机械臂
-            all_positions_desired.append(positions[traj_index,:]) # 保存期望关节角度
-            cur_joint = positions[traj_index,:] # 更新当前关节角度
-            cur_joint_vel = velocities[traj_index,:] # 更新当前关节角速度
-            cur_joint_acc = accelerations[traj_index,:] # 更新当前关节角加速度
+            robot.set_waypoint_to_canbus(tuple(positions[:,traj_index])) # 透传目标位置给机械臂
+            all_positions_desired.append(positions[:,traj_index]) # 保存期望关节角度
             traj_index += 1 # 更新轨迹索引
 
         else:
@@ -457,6 +557,7 @@ def servo_j():
 
         # 时间补偿, 保证内环控制周期为move_period
         elapsed_time = time.time()-st_time
+        # print('内环elapsed_time: ', elapsed_time)
         if elapsed_time > move_period:
             pass
         else:
@@ -473,28 +574,28 @@ if __name__ == '__main__':
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect(server_address)
     logger.info("连接力传感器成功")
+    read_force_data_running = True # 读取数据线程运行标志
+    # ======================================================
     
     # =====================机器人连接=========================
     Auboi5Robot.initialize() 
     robot = Auboi5Robot()
     handle = robot.create_context() # 创建上下文
     result = robot.connect('192.168.26.103', 8899)
-    if result != RobotErrorType.RobotError_SUCC:
-        logger.info("连接机器人失败")
-    else:
-        logger.info("连接机器人成功")
     robot.set_collision_class(6) # 设置碰撞等级
     robot.init_profile() # 初始化全局配置文件 自动清理掉之前设置的用户坐标系，速度，加速度等属性
-    robot.set_joint_maxacc((2.5, 2.5, 2.5, 2.5, 2.5, 2.5)) # 设置关节最大加速度 rad/s^2
-    robot.set_joint_maxvelc((2, 2, 2, 2, 2, 2)) # 设置关节最大速度 rad/s
+    robot.set_joint_maxacc((0.8, 0.8, 0.8, 0.8, 0.8, 0.8)) # 设置关节最大加速度 rad/s^2
+    robot.set_joint_maxvelc((0.8, 0.8, 0.8, 0.8, 0.8, 0.8)) # 设置关节最大速度 rad/s
     line_maxacc = 0.6 # 设置末端运动最大线加速度 m/s^2
     robot.set_end_max_line_acc(line_maxacc)
     line_maxvelc = 0.6 # 设置末端运动最大线速度 m/s
     robot.set_end_max_line_velc(line_maxvelc)
+    # ======================================================
 
     # =========================pykin=========================
     pykin = SingleArm(f_name="./description/aubo_i10.urdf")
     pykin.setup_link_name(base_name="base_link", eef_name="wrist3_Link")
+    # ======================================================
 
     
     # =====================保存读取数据初始化===================
@@ -504,22 +605,28 @@ if __name__ == '__main__':
     joint_data_list = [] # 记录每次读取的关节角度
     p_end_list = [] # 记录每次规划的末端位置
     time_list = [] # 记录每次读取的时间
-    read_data_running = True # 读取数据线程运行标志
+    read_force_data_running = True # 读取数据线程运行标志
     G_force = np.zeros(6) # Gx Gy Gz Mgx Mgy Mgz 负载重力在力传感器坐标系下的分量
+    # ======================================================
 
 
     # ========================读取外部力数据====================
     # 单开一个线程读取力传感器数据
-    read_data_thread = threading.Thread(target=read_force_data, args=(sock,robot))
-    read_data_thread.start()
-    logger.info("等待读取外部力数据线程启动")
+    read_force_data_thread = threading.Thread(target=read_force_data, args=(sock,))
+    read_force_data_thread.start()
+    time.sleep(1) # 等待线程启动
+    logger.info("读取原始外部力数据线程启动")
 
-    # # 初始化ROS节点
-    # rospy.init_node('subscribe_joint_state', anonymous=True)
+    calib_force_data_thread = threading.Thread(target=calib_force_data_func,args=(robot,))
+    calib_force_data_thread.start()
+    time.sleep(0.5) # 等待线程启动
+    logger.info("读取校准外部力数据线程启动")
+    # ======================================================
+
 
     # ===================设置 servo_j 内环位置控制参数===============
     trajectory_queue = queue.Queue() # 初始化轨迹队列
-    move_period = 0.01  # 内环控制周期 10ms
+    move_period = 0.035  # 内环控制周期 
     lookahead_time = 0.2  # Lookahead time (s) 前瞻时间，用0.2s规划轨迹
     num_joints = 6  # Number of joints
     cur_joint = np.zeros(num_joints) # 当前关节角 [0, 0, 0, 0, 0, 0]
@@ -530,11 +637,12 @@ if __name__ == '__main__':
     # 记录整段轨迹的期望关节角度和实际关节角度    
     all_positions_desired = []
     all_positions_real = []
+    # ======================================================
 
     # ==========================主程序=========================
     try:
 
-        servo_j_thread = threading.Thread(target=servo_j)
+        servo_j_thread = threading.Thread(target=servo_j) # 内环位置控制线程
         servo_j_thread.start()
         admittance_controller() # 导纳控制器
         
@@ -547,24 +655,15 @@ if __name__ == '__main__':
         logger.info("程序异常退出: ", e)
 
     finally:
-        
-        # 将 all_positions_desired 中的 NumPy 数组转换为 Python 列表
-        all_positions_converted_desired = [pos.tolist() for pos in all_positions_desired]
-        all_positions_real_converted = [pos.tolist() for pos in all_positions_real]
-
-        with open('trajectory_data.json', 'w') as f:
-            json.dump(all_positions_converted_desired, f)
-        
-        with open('trajectory_data_real.json', 'w') as f:
-            json.dump(all_positions_real_converted, f)
 
         # 结束内环servoj线程
         servo_j_running = False
         servo_j_thread.join()
 
         # 结束读取力传感数据和机器人状态的线程
-        read_data_running = False
-        read_data_thread.join()
+        read_force_data_running = False
+        read_force_data_thread.join()
+        calib_force_data_thread.join()
 
         logger.info("程序结束, 关闭socket连接和机器人连接")
 
@@ -583,6 +682,16 @@ if __name__ == '__main__':
         # 将力数据保存为 JSON 文件
         with open('force_data.json', 'w') as f:
             json.dump(force_data_list_converted, f)
+
+        # 将 all_positions_desired 中的 NumPy 数组转换为 Python 列表
+        all_positions_converted_desired = [pos.tolist() for pos in all_positions_desired]
+        all_positions_real_converted = [pos.tolist() for pos in all_positions_real]
+
+        with open('trajectory_data.json', 'w') as f:
+            json.dump(all_positions_converted_desired, f)
+        
+        with open('trajectory_data_real.json', 'w') as f:
+            json.dump(all_positions_real_converted, f)
 
         # 画图
         max_time = np.round(max(time_list)+1).astype(int)
@@ -619,6 +728,7 @@ if __name__ == '__main__':
                 ax2.set_ylim(np.min(data[:, 3:]) - 1, np.max(data[:, 3:]) + 1)
 
         plt.tight_layout()
+        plt.savefig('force_data.png')
                 
         # 画末端位置和姿态图
         fig2, (ax3, ax4) = plt.subplots(2, 1)
@@ -653,6 +763,7 @@ if __name__ == '__main__':
                 ax4.set_ylim(np.min(pose_data[:, 3:]) - 10, np.max(pose_data[:, 3:]) + 10)
 
         plt.tight_layout()
+        plt.savefig('pose_data.png')
 
         # 创建一个三维图形
         fig3 = plt.figure()
@@ -670,5 +781,6 @@ if __name__ == '__main__':
         ax.set_zlabel('Z Position (m)')
         ax.set_title('End Effector Position Trajectory')
         ax.legend()
+        plt.savefig('end_effector_position_trajectory.png')
         plt.show()
 

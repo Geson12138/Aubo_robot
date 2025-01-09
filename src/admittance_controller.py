@@ -47,7 +47,7 @@ def pose_sub(pos1, pos2):
     return pose
 
 class AdmittanceController:
-    def __init__(self, mass, stiffness, damping_ratio, dt):
+    def __init__(self, mass, stiffness, damping, dt):
         """
         初始化导纳控制器，考虑惯性、刚度和阻尼之间的关系。
         :param mass: 惯性参数列表 [m_x, m_y, m_z, m_roll, m_pitch, m_yaw]
@@ -57,7 +57,7 @@ class AdmittanceController:
         """
         self.M = np.diag(mass)  # 惯性矩阵
         self.K = np.diag(stiffness)  # 刚度矩阵
-        self.B = np.diag([2 * damping_ratio * np.sqrt(m * k) for m, k in zip(mass, stiffness)])  # 阻尼矩阵 B = 2ξ√(M * K)
+        self.B = np.diag(damping)  # 阻尼矩阵 
         self.dt = dt  # 控制周期
 
         # 状态初始化
@@ -90,10 +90,10 @@ class AdmittanceController:
         self.velocity_error += acceleration * self.dt
 
         # 使用期望速度误差更新期望位姿误差：期望位姿误差 = 期望速度误差 * dt
-        self.pose_error += self.velocity_error * self.dt
+        pose_error += self.velocity_error * self.dt
 
         # 利用期望位姿误差更新当前位置：当前位置 = 期望位置 + 期望位姿误差
-        self.position = pose_add(des_eef_pose, self.pose_error)
+        self.position = pose_add(des_eef_pose, pose_error)
 
         return self.position
 
@@ -103,11 +103,11 @@ if __name__ == "__main__":
     # 定义质量、刚度和阻尼比
     mass = [1.0, 1.0, 1.0, 0.1, 0.1, 0.1]  # 惯性参数
     stiffness = [50.0, 50.0, 50.0, 10.0, 10.0, 10.0]  # 刚度参数
-    damping_ratio = 0.9  # 阻尼比（ξ）
+    damping = [1.0, 1.0, 1.0, 0.1, 0.1, 0.1]  # 阻尼参数
     dt = 0.01  # 控制周期（单位：秒）
 
     # 初始化控制器
-    controller = AdmittanceController(mass, stiffness, damping_ratio, dt)
+    controller = AdmittanceController(mass, stiffness, damping, dt)
 
     # 期望六维位置和速度
     des_eef_pose = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
@@ -115,6 +115,7 @@ if __name__ == "__main__":
 
     # 模拟控制循环
     positions = []
+    total_force = []
     total_steps = 500
     half_steps = total_steps // 2
     for step in range(total_steps):
@@ -123,6 +124,7 @@ if __name__ == "__main__":
         else:
             z = 10.0 * (1 - (step - half_steps) / half_steps)  # 从5降到0
         measured_force = np.array([0.0, 0.0, 0.0, 0.0, 0.0, z])  # 实际测量的力值
+        total_force.append(measured_force.copy())
 
         # 通过导纳控制器计算新的位置
         updated_position = controller.update(des_eef_pose, des_eef_vel, measured_force)
@@ -130,3 +132,12 @@ if __name__ == "__main__":
 
     # 打印位置调整量
     print(f"Step {step}, Updated Position: {updated_position}")
+
+    plt.figure()
+    plt.plot(range(total_steps), [p[5] for p in positions], label="Yaw Position")
+    plt.plot(range(total_steps), [f[5] for f in total_force], label="Z Force")
+    plt.xlabel("Step")
+    plt.ylabel("Value")
+    plt.legend()
+    plt.show()
+

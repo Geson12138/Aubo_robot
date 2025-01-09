@@ -95,6 +95,7 @@ def read_force_data(sock):
                 buffer = buffer[end_pos + len(PACK_END.encode()):]
                 force_data = None
 
+        logger.info("原始力传感器数据:{}".format(force_data[1]))
 
 ## -----------------------力传感器标定参数-----------------------
 force_zero = np.zeros(6) # fx0 fy0 fz0 Mx0 My0 Mz0 力传感器零点
@@ -335,6 +336,7 @@ def validate_calibrate_result(robot):
 
     alpha = 0.8
     smoothed_force_data = np.array(force_data).copy()
+    time_count = 0
 
     while running:
 
@@ -354,7 +356,7 @@ def validate_calibrate_result(robot):
         filtered_signal = filtfilt(b, a, force_data_queue, axis=0)
         new_force_data = filtered_signal[-1]
 
-        smoothed_force_data = alpha * new_force_data  + (1-alpha) * smoothed_force_data
+        smoothed_force_data = alpha * raw_force_data  + (1-alpha) * smoothed_force_data
         # smoothed_force_data = np.mean(filtered_signal, axis=0)
 
         '''
@@ -381,7 +383,11 @@ def validate_calibrate_result(robot):
         force_data_list.append(calib_force_data)
         time_data_list.append(current_time)
 
-        time.sleep(0.005) # 5ms 一次
+        time_count += 1 
+        # if time_count % 2 == 0:
+        #     print('calib_force_data:', calib_force_data[1])
+
+        time.sleep(0.0001) # 5ms 一次
 
 # 全局变量用于存储力传感数据和时间戳，最大长度为4000
 force_data_list = deque(maxlen=4000)

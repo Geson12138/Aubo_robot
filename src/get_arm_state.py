@@ -78,18 +78,18 @@ if __name__ == '__main__':
             print('time get current joint: ',time.time()-st_time)
 
             # 当前关节角 
-            real_joint_rad = np.round(np.array(current_waypoint['joint']),4) # in rad
+            real_joint_rad = np.round(np.array(current_waypoint['joint']),8) # in rad
             real_joint_deg = real_joint_rad/np.pi*180                        # in degree
             print(f"直接获取-关节joint in radian:{[rq for rq in real_joint_rad]}")
             print(f"直接获取-关节joint in degree:{[rq for rq in real_joint_deg]}")
 
             # 当前末端位置 in m
-            ee_pos = [np.round(i,4) for i in current_waypoint['pos']]
+            ee_pos = [np.round(i,8) for i in current_waypoint['pos']]
             print(f"直接获取-末端position:{[rq for rq in ee_pos]} m")
 
             # 当前末端姿态
-            ee_ori_rpy_rad = np.round(np.array(robot.quaternion_to_rpy(current_waypoint['ori'])),4) # in rad
-            ee_ori_rpy_deg = np.round(ee_ori_rpy_rad/np.pi*180,4) # in degree
+            ee_ori_rpy_rad = np.round(np.array(robot.quaternion_to_rpy(current_waypoint['ori'])),8) # in rad
+            ee_ori_rpy_deg = np.round(ee_ori_rpy_rad/np.pi*180,8) # in degree
             print(f"直接获取-末端oritation:{[rq for rq in ee_ori_rpy_rad]} in radian")
             print(f"直接获取-末端oritation:{[rq for rq in ee_ori_rpy_deg]} in degree")
 
@@ -97,12 +97,12 @@ if __name__ == '__main__':
             fk_result = robot.forward_kin(joint_radian=list(real_joint_rad))
 
             # 当前末端位置 in m
-            fk_ee_pos = [np.round(i,4) for i in fk_result['pos']]
+            fk_ee_pos = [np.round(i,8) for i in fk_result['pos']]
             print(f"自带正运动学-末端位置:{[rq for rq in fk_ee_pos]} m")
 
             # 当前末端姿态
-            fk_ee_ori_rpy_rad = np.round(np.array(robot.quaternion_to_rpy(fk_result['ori'])),4) # in rad
-            fk_ee_ori_rpy_deg = np.round(ee_ori_rpy_rad/np.pi*180,4) # in degree
+            fk_ee_ori_rpy_rad = np.round(np.array(robot.quaternion_to_rpy(fk_result['ori'])),8) # in rad
+            fk_ee_ori_rpy_deg = np.round(ee_ori_rpy_rad/np.pi*180,8) # in degree
             print(f"自带正运动学-末端姿态:{[rq for rq in fk_ee_ori_rpy_rad]} in radian")
             print(f"自带正运动学-末端姿态:{[rq for rq in fk_ee_ori_rpy_deg]} in degree")
 
@@ -110,12 +110,12 @@ if __name__ == '__main__':
             pykin_result = pykin.forward_kin(real_joint_rad)
 
             # 当前末端位置 in m       
-            py_ee_pos = np.round(np.array(pykin_result[pykin.eef_name].pos),4)
+            py_ee_pos = np.round(np.array(pykin_result[pykin.eef_name].pos),8)
             print(f"pykin正运动学-末端位置:{[rq for rq in py_ee_pos]} m")
 
             # 当前末端姿态
-            py_ee_ori_rpy_rad = np.round(np.array(transform_utils.get_rpy_from_quaternion(pykin_result[pykin.eef_name].rot)),4) # in rad
-            py_ee_ori_rpy_deg = np.round(py_ee_ori_rpy_rad/np.pi*180,4) # in degree
+            py_ee_ori_rpy_rad = np.round(np.array(transform_utils.get_rpy_from_quaternion(pykin_result[pykin.eef_name].rot)),8) # in rad
+            py_ee_ori_rpy_deg = np.round(py_ee_ori_rpy_rad/np.pi*180,8) # in degree
             print(f"正运动学-末端姿态:{[rq for rq in py_ee_ori_rpy_rad]} in radian")
             print(f"正运动学-末端姿态:{[rq for rq in py_ee_ori_rpy_deg]} in degree")    
 
