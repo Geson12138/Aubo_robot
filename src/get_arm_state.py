@@ -11,6 +11,7 @@ import json
 from lib.robotcontrol import Auboi5Robot, RobotError, RobotErrorType, RobotEventType, RobotEvent, RobotMoveTrackType, RobotCoordType, RobotIOType, RobotUserIoName
 from pykin.robots.single_arm import SingleArm
 from pykin.utils import transform_utils as transform_utils
+from spatialmath import SE3
 
 
 # 创建一个logger
@@ -51,7 +52,7 @@ if __name__ == '__main__':
 
     # ==================pykin====================
     pykin = SingleArm(f_name="./description/aubo_i10.urdf")
-    pykin.setup_link_name(base_name="base_link", eef_name="wrist3_Link")
+    pykin.setup_link_name(base_name="base_link", eef_name="Tool_Link")
 
     # 创建上下文
     handle = robot.create_context()
@@ -72,6 +73,10 @@ if __name__ == '__main__':
             # 设置碰撞等级
             robot.set_collision_class(7)
 
+            robot.init_profile() # 初始化全局配置文件 自动清理掉之前设置的用户坐标系，速度，加速度等属性
+
+            trans_flange2tcp = SE3.Trans(0, 0, 0.211) # flange to tcp
+
             # 获取机械臂状态
             st_time = time.time()
             current_waypoint = robot.get_current_waypoint()
@@ -86,12 +91,23 @@ if __name__ == '__main__':
             # 当前末端位置 in m
             ee_pos = [np.round(i,8) for i in current_waypoint['pos']]
             print(f"直接获取-末端position:{[rq for rq in ee_pos]} m")
+            print(transform_utils.get_matrix_from_quaternion(current_waypoint['ori']))
 
             # 当前末端姿态
             ee_ori_rpy_rad = np.round(np.array(robot.quaternion_to_rpy(current_waypoint['ori'])),8) # in rad
             ee_ori_rpy_deg = np.round(ee_ori_rpy_rad/np.pi*180,8) # in degree
             print(f"直接获取-末端oritation:{[rq for rq in ee_ori_rpy_rad]} in radian")
             print(f"直接获取-末端oritation:{[rq for rq in ee_ori_rpy_deg]} in degree")
+
+            flange_pose = SE3.Trans(ee_pos[0], ee_pos[1], ee_pos[2]) * SE3.RPY(ee_ori_rpy_rad[0], ee_ori_rpy_rad[1], ee_ori_rpy_rad[2])
+            tcp_pose = (flange_pose * trans_flange2tcp)
+            tcp_pos = tcp_pose.t; tcp_ori = tcp_pose.rpy()
+            tcp_mat = tcp_pose.R
+
+
+            print('tcp_pos: ', tcp_pos)
+            print('tcp_ori: ', tcp_ori)
+            print('tcp_mat: ', tcp_mat)
 
             print("\n==================自带正运动学库计算当前末端位置==================\n")
             fk_result = robot.forward_kin(joint_radian=list(real_joint_rad))

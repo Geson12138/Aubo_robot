@@ -93,9 +93,9 @@ def test_gripper():
 
             robot.set_gripper_init() # 初始化夹具
             time.sleep(2) 
-            # robot.set_gripper_close() # 夹具闭合
+            robot.set_gripper_close() # 夹具闭合
             # time.sleep(5)
-            robot.set_gripper_open() # 夹具打开
+            # robot.set_gripper_open() # 夹具打开
 
             # 断开服务器链接
             robot.disconnect()

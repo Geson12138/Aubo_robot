@@ -65,7 +65,7 @@ plt.savefig('trajectory_acc_real.png')
 
 # ==============================实际关节变化曲线==============================
 # 获取样本数量
-n_samples = trajectory_array.shape[0]
+n_samples = trajectory_array_real.shape[0]
 
 # 创建一个窗口，包含6个子图
 fig, axes = plt.subplots(6, 1, figsize=(12, 18))
@@ -73,7 +73,7 @@ joint_labels = ['Joint 1', 'Joint 2', 'Joint 3', 'Joint 4', 'Joint 5', 'Joint 6'
 
 # 绘制每个关节的变化曲线
 for i in range(6):
-    axes[i].plot(np.arange(n_samples), trajectory_array_real[:n_samples, i], label=f'Real {joint_labels[i]}', color='red')
+    axes[i].plot(np.arange(n_samples), trajectory_array_real[:, i], label=f'Real {joint_labels[i]}', color='red')
     # axes[i].plot(np.arange(n_samples), trajectory_array[:, i], label=f'Desired {joint_labels[i]}' ,color='blue')
     axes[i].set_xlabel('Sample')
     axes[i].set_ylabel('Angle (rad)')

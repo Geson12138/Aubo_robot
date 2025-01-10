@@ -236,4 +236,21 @@
     <limit lower="-3.04" upper="3.04" effort="0" velocity="0" />
   </joint>
 
+<!-- Tool_Link -->
+
+  <link name="Tool_Link">
+    <inertial>
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0" />
+    </inertial>
+  </link>
+
+<!-- Tool_Joint -->
+
+  <joint name="Tool_Joint" type="fixed">
+    <origin xyz="0.0 0.0 0.211" rpy="0.0 0.0 0.0" />
+    <parent link="wrist3_Link" />
+    <child link="Tool_Link" />
+  </joint>
+
+
 </robot>

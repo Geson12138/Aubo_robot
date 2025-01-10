@@ -20,6 +20,7 @@ import rospy
 from std_msgs.msg import Float64MultiArray
 import queue
 import concurrent.futures
+from spatialmath import SE3
 
 
 # 创建一个logger
@@ -48,8 +49,6 @@ def logger_init():
 
     logger.addHandler(fh) # 设置文件输出到logger
     logger.addHandler(ch) # 设置控制台输出到logger
-
-
 
 
 # 定义报文头和尾
@@ -195,10 +194,6 @@ def calib_force_data_func(robot):
             force_data_list.append(calib_force_data) # 末端受到的外部力
             pose_data_list.append(pose_data) # 末端位置和姿态
             time_list.append(time.time() - start_time) # 时间
-            
-            # time_count += 1
-            # if time_count % 10 == 0:
-            #     logger.info("calib_force_data: {}\n".format(calib_force_data[1]))
 
             time.sleep(0.005) # 5ms/次
         
@@ -266,10 +261,10 @@ def robot_inverse_kinematic(target_pos,target_ori_rpy_rad):
     '''
     global robot
     current_waypoint = robot.get_current_waypoint()
-    current_joint_rad = np.round(np.array(current_waypoint['joint']),4) # in rad
+    current_joint_rad = np.array(current_waypoint['joint']) # in rad
     target_rot = transform_utils.get_matrix_from_rpy(target_ori_rpy_rad)
     target_pose = np.eye(4);target_pose[:3, :3] = target_rot; target_pose[:3, 3] = target_pos
-    r_qd = pykin.inverse_kin(current_joint_rad, target_pose, method="LM", max_iter=10)
+    r_qd = pykin.inverse_kin(current_joint_rad, target_pose, method="LM", max_iter=20)
 
     # 轴动到初始位置
     desired_joint = tuple(r_qd)
@@ -368,6 +363,27 @@ def trapezoidal_velocity_corrected(theta_start, theta_end, acc_time, dcc_time, c
     
     return t_vals, theta_vals, vel_vals
 
+def trans_force_data(trans_matrix, force_data):
+    '''
+    将力传感器数据从A坐标系转换到B坐标系
+    :param trans_matrix: 坐标系转换矩阵: 从A坐标系到B坐标系, B坐标系下A坐标系的位姿
+    :param force_data: A坐标系下的力传感器数据 [Fx, Fy, Fz, Tx, Ty, Tz]
+    :return: B坐标系下的力传感器数据 [Fx, Fy, Fz, Tx, Ty, Tz]
+    '''
+    trans = trans_matrix[:3,3]; oritation = trans_matrix[:3,:3]
+    trans_inv = np.array([
+        [0, -trans[2], trans[1]],
+        [trans[2], 0, -trans[0]],
+        [-trans[1], trans[0], 0]   
+    ])
+    # 伴随矩阵
+    adjoint_matrix = np.zeros((6,6))
+    adjoint_matrix[:3,:3] = oritation; adjoint_matrix[3:,3:] = oritation
+    adjoint_matrix[:3,3:] = 0; adjoint_matrix[3:, :3] = np.dot(trans_inv, oritation)
+    new_force_data = np.dot(adjoint_matrix, force_data)
+
+    return new_force_data
+
 def admittance_controller():
     '''
     阻抗控制器, 用于机械臂外环控制, 控制周期25hz
@@ -390,22 +406,23 @@ def admittance_controller():
 
     # 获取当前末端位姿
     current_waypoint = robot.get_current_waypoint()
-    current_joint_rad = np.round(np.array(current_waypoint['joint']),4) # in rad
-    ee_pos = np.array([np.round(i,4) for i in current_waypoint['pos']]) # 当前末端位置 in m
-    ee_ori_quater = np.round(np.array(current_waypoint['ori']),4) # 当前末端姿态 in quaternion
-    ee_ori_rpy_rad = np.round(np.array(robot.quaternion_to_rpy(ee_ori_quater)),4) # # 当前末端姿态 in rad
+    ee_pos = np.array(current_waypoint['pos']) # 当前末端位置 in m
+    ee_ori_rpy_rad = np.array(robot.quaternion_to_rpy(current_waypoint['ori'])) # # 当前末端姿态 in rad
+    flange_pose = SE3.Trans(ee_pos[0], ee_pos[1], ee_pos[2]) * SE3.RPY(ee_ori_rpy_rad[0], ee_ori_rpy_rad[1], ee_ori_rpy_rad[2])
+    tcp_pose = (flange_pose * trans_flange2tcp)
+    tcp_pos = np.array(tcp_pose.t); tcp_ori = np.array(tcp_pose.rpy())
 
     # 模拟直线路径
     trans_length = 0.05  # 平移距离
-    p_start = ee_pos.copy() # 起点位置
+    p_start = tcp_pos.copy() # 起点位置
     # p_start[0] = p_start[0] + trans_length # 移动到最左端
 
-    # desired_joint = robot_inverse_kinematic(p_start,ee_ori_rpy_rad) # 末端期望位置 / m， 角度rqy / rad
+    # desired_joint = robot_inverse_kinematic(p_start,tcp_ori) # 末端期望位置 / m， 角度rqy / rad
     # robot.move_joint(desired_joint)
     # time.sleep(2)
 
     # 先进行路径规划, 规划每一个目标点的位姿
-    num_points = 1000  # 轨迹上的点数
+    num_points = 600  # 轨迹上的点数
     delta_steps = np.linspace(0, trans_length, num_points) # 向右平移
 
     for delta_step in delta_steps:
@@ -426,7 +443,7 @@ def admittance_controller():
     acc_time = 1 * control_period  # 加速时间 (s)
     dcc_time = 1 * control_period  # 减速时间 (s)
     joint_vel_limit = np.ones(6) * 0.03  # 每个关节的最大角速度 (rad/s)
-    joint_acc_limit = np.ones(6) * 0.05  # 计算最大角加速度
+    joint_acc_limit = np.ones(6) * 0.04  # 计算最大角加速度
     prev_joint_vel = np.zeros(6) # 保存上一周期周期的关节速度
     prev_joint_acc = np.zeros(6) # 保存上一周期周期的关节加速度
 
@@ -442,6 +459,8 @@ def admittance_controller():
     force_data_zero()
 
     logger.info("进入外环导纳控制周期，控制周期{}ms".format(control_period*1000))
+
+    user_force = np.array([0.0, 0.0, 0.0, 0.0, 1.0, 0.0]) # 用户期望受力，传感器坐标系下
     
     for i in range(num_points):
 
@@ -451,25 +470,28 @@ def admittance_controller():
         current_waypoint = robot.get_current_waypoint()
         cur_joint = np.array(current_waypoint['joint']) # in rad 
         ee_pos = np.array(current_waypoint['pos']) # 当前末端位置 in m
-        ee_ori_quater = np.array(current_waypoint['ori']) # 当前末端姿态 in quaternion
-        ee_ori_rpy_rad = np.array(robot.quaternion_to_rpy(ee_ori_quater)) # # 当前末端姿态 in rad
+        ee_ori_rpy_rad = np.array(robot.quaternion_to_rpy(current_waypoint['ori'])) # # 当前末端姿态 in rad
+        flange_pose = SE3.Trans(ee_pos[0], ee_pos[1], ee_pos[2]) * SE3.RPY(ee_ori_rpy_rad[0], ee_ori_rpy_rad[1], ee_ori_rpy_rad[2])
+        tcp_pose = flange_pose * trans_flange2tcp
+        tcp_pos = np.array(tcp_pose.t); tcp_ori = np.array(tcp_pose.rpy())
 
         # # 等待并获取最新的 joint_angles 话题消息
         all_positions_real.append(cur_joint) # in rad
 
         # 获取当前末端位置和姿态
-        controller.eef_pose = np.concatenate((ee_pos, ee_ori_rpy_rad), axis=0) # 6*1
+        controller.eef_pose = np.concatenate((tcp_pos, tcp_ori), axis=0) # 6*1
 
         # 根据规划的路径获取旧的末端期望位姿
         des_eef_pose = p_end_array[i, :]
 
-        # 将传感器坐标系下的力转换到基坐标系下，注意此时受力坐标系为传感器坐标系，不是末端坐标系
-        py_ee_transmat = np.array(transform_utils.get_matrix_from_quaternion(ee_ori_quater)) # 3*3 末端姿态矩阵
-        contact_force = py_ee_transmat @ calib_force_data[:3] # 末端受到的外部力转换到基坐标系下
-        contact_troque = py_ee_transmat @ calib_force_data[3:] # 末端受到的外部力矩转换到基坐标系下
-        contact_force_data = np.concatenate((contact_force, contact_troque), axis=0) # 6*1
+        # 将传感器坐标系下的力转换到末端坐标系下，注意此时受力坐标系为末端坐标系
+        force2tcp = SE3.Trans(0.0, 0.0, -0.196) * SE3.RPY(0, 0, 0) # 力传感器坐标系到末端坐标系的转换矩阵
+        contact_force_data_inTcp = trans_force_data(force2tcp.A, calib_force_data) # 6*1
 
-        contact_force_data = contact_force_data + np.array([-10.0, 0.0, 0.0, 0.0, 0.0, 0.0]) # 加上重力补偿
+        contact_force_data_inTcp = contact_force_data_inTcp + user_force # 加上用户期望受力，末端坐标系下
+
+        # 将末端坐标系下的力转换到基坐标系下
+        contact_force_data = trans_force_data(tcp_pose.A, contact_force_data_inTcp) # 6*1
 
         # 通过导纳控制器计算新的末端期望位姿
         updated_eef_pose = controller.update(des_eef_pose, des_eef_vel, contact_force_data)
@@ -586,11 +608,12 @@ if __name__ == '__main__':
     robot.set_end_max_line_acc(line_maxacc)
     line_maxvelc = 0.6 # 设置末端运动最大线速度 m/s
     robot.set_end_max_line_velc(line_maxvelc)
+    trans_flange2tcp = SE3.Trans(0, 0, 0.211) # flange to tcp
     # ======================================================
 
     # =========================pykin=========================
     pykin = SingleArm(f_name="./description/aubo_i10.urdf")
-    pykin.setup_link_name(base_name="base_link", eef_name="wrist3_Link")
+    pykin.setup_link_name(base_name="base_link", eef_name="Tool_Link")
     # ======================================================
 
     
@@ -653,6 +676,9 @@ if __name__ == '__main__':
 
     finally:
 
+        robot.move_pause() # 暂停机械臂运动
+        robot.move_stop() # 停止机械臂运动
+        
         # 结束内环servoj线程
         servo_j_running = False
         servo_j_thread.join()
