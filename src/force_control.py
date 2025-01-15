@@ -191,8 +191,7 @@ def calib_force_data_func(robot):
             calib_force_data = smoothed_force_data - force_zero - G_force - force_zero_point # 6*1
             
             # 保存数据
-            force_data_list.append(calib_force_data) # 末端受到的外部力
-            pose_data_list.append(pose_data) # 末端位置和姿态
+            force_data_inSensor_list.append(calib_force_data) # 末端受到的外部力
             time_list.append(time.time() - start_time) # 时间
 
             time.sleep(0.005) # 5ms/次
@@ -271,47 +270,67 @@ def robot_inverse_kinematic(target_pos,target_ori_rpy_rad):
     return desired_joint
 
 
-# Function to compute and generate the 5th-order polynomial trajectory
-def generate_trajectory(q_start, v_start, a_start, q_end, v_end, a_end, move_period, lookahead_time):
+def generate_trajectory_with_constraints(q_start, v_start, a_start, q_end, v_end, a_end, move_period, lookahead_time, max_velocity, max_acceleration):
     """
-    Generate 5th-order polynomial trajectory for all joints.
-    :param q_start: Initial joint positions
-    :param v_start: Initial joint velocities
-    :param a_start: Initial joint accelerations
-    :param q_end: Target joint positions
-    :param v_end: Target joint velocities
-    :param a_end: Target joint accelerations
-    :param move_period: Time interval for trajectory sampling
-    :param lookahead_time: Total time for trajectory planning
-    :return: Position, velocity, and acceleration trajectories for all joints
+    生成五次多项式轨迹，确保速度和加速度不超限，并返回时间戳
+    :param q_start: 初始位置 (数组)
+    :param v_start: 初始速度 (数组)
+    :param a_start: 初始加速度 (数组)
+    :param q_end: 目标位置 (数组)
+    :param v_end: 目标速度 (数组)
+    :param a_end: 目标加速度 (数组)
+    :param move_period: 轨迹采样时间间隔
+    :param lookahead_time: 轨迹总时长
+    :param max_velocity: 允许的最大速度
+    :param max_acceleration: 允许的最大加速度
+    :return: 时间戳、轨迹的位置信息、速度信息、加速度信息、最终轨迹时长
     """
     num_joints = len(q_start)
-    t = np.arange(0, lookahead_time, move_period)  # Time steps
+    
+    # 动态调整轨迹时间，保证最大速度和最大加速度
+    T = lookahead_time
 
-    # Initialize trajectory arrays
-    positions = np.zeros((len(t), num_joints))
-    velocities = np.zeros((len(t), num_joints))
-    accelerations = np.zeros((len(t), num_joints))
+    while True:
+        t_vals = np.arange(0, T + move_period, move_period)  # 生成时间戳
+        positions = np.zeros((len(t_vals), num_joints))
+        velocities = np.zeros((len(t_vals), num_joints))
+        accelerations = np.zeros((len(t_vals), num_joints))
 
-    for j in range(num_joints):
-        # Compute coefficients for 5th-order polynomial
-        A = np.array([
-            [1, 0, 0, 0, 0, 0],
-            [0, 1, 0, 0, 0, 0],
-            [0, 0, 2, 0, 0, 0],
-            [1, lookahead_time, lookahead_time**2, lookahead_time**3, lookahead_time**4, lookahead_time**5],
-            [0, 1, 2*lookahead_time, 3*lookahead_time**2, 4*lookahead_time**3, 5*lookahead_time**4],
-            [0, 0, 2, 6*lookahead_time, 12*lookahead_time**2, 20*lookahead_time**3]
-        ])
-        B = np.array([q_start[j], v_start[j], a_start[j], q_end[j], v_end[j], a_end[j]])
-        coeffs = np.linalg.solve(A, B)
+        max_v = 0
+        max_a = 0
 
-        # Generate position, velocity, and acceleration
-        positions[:, j] = coeffs[0] + coeffs[1]*t + coeffs[2]*t**2 + coeffs[3]*t**3 + coeffs[4]*t**4 + coeffs[5]*t**5
-        velocities[:, j] = coeffs[1] + 2*coeffs[2]*t + 3*coeffs[3]*t**2 + 4*coeffs[4]*t**3 + 5*coeffs[5]*t**4
-        accelerations[:, j] = 2*coeffs[2] + 6*coeffs[3]*t + 12*coeffs[4]*t**2 + 20*coeffs[5]*t**3
+        for j in range(num_joints):
+            # 计算五次多项式系数
+            A = np.array([
+                [1, 0, 0, 0, 0, 0],
+                [0, 1, 0, 0, 0, 0],
+                [0, 0, 2, 0, 0, 0],
+                [1, T, T**2, T**3, T**4, T**5],
+                [0, 1, 2*T, 3*T**2, 4*T**3, 5*T**4],
+                [0, 0, 2, 6*T, 12*T**2, 20*T**3]
+            ])
+            B = np.array([q_start[j], v_start[j], a_start[j], q_end[j], v_end[j], a_end[j]])
+            coeffs = np.linalg.solve(A, B)
 
-    return positions, velocities, accelerations
+            # 计算轨迹
+            positions[:, j] = coeffs[0] + coeffs[1]*t_vals + coeffs[2]*t_vals**2 + coeffs[3]*t_vals**3 + coeffs[4]*t_vals**4 + coeffs[5]*t_vals**5
+            velocities[:, j] = coeffs[1] + 2*coeffs[2]*t_vals + 3*coeffs[3]*t_vals**2 + 4*coeffs[4]*t_vals**3 + 5*coeffs[5]*t_vals**4
+            accelerations[:, j] = 2*coeffs[2] + 6*coeffs[3]*t_vals + 12*coeffs[4]*t_vals**2 + 20*coeffs[5]*t_vals**3
+
+            # 记录最大速度和加速度
+            max_v = max(max_v, np.max(np.abs(velocities[:, j])))
+            max_a = max(max_a, np.max(np.abs(accelerations[:, j])))
+
+        # 判断是否满足最大速度和最大加速度的约束 或者超过了一定时间限制
+        if (max_v <= max_velocity and max_a <= max_acceleration) or T >= 1.0:
+            # print(f"planning time: {T}")
+            break  # 如果满足约束，停止调整
+        
+        T +=0.02  # 增大轨迹时间，降低速度和加速度
+    
+    return t_vals, positions, velocities, accelerations, T  # 返回时间戳
+
+
 
 def trapezoidal_velocity_corrected(theta_start, theta_end, acc_time, dcc_time, control_period, joint_vel_limit,prev_vel, prev_acc, max_delta_vel):
     """
@@ -390,6 +409,7 @@ def admittance_controller():
     '''
 
     global flag_enter_tco2canbus, calib_force_data
+    global first_phase_end, second_phase_start, second_phase_end, third_phase_start, third_phase_end
 
     # 设置admittance control阻抗控制器参数
     mass = [10.0, 10.0, 10.0, 2.0, 2.0, 2.0]  # 定义惯性参数
@@ -404,46 +424,62 @@ def admittance_controller():
     des_eef_pose = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     des_eef_vel = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
+    # 预设初始关节角度
+    desired_joint = [1.3183549782708925, 0.2844580396074309, -1.9350581848325896, 0.9220872927851061, 1.318360580565033, 4.956739951040262] # in rad
+    robot.move_joint(tuple(desired_joint))
+    time.sleep(2)
+
     # 获取当前末端位姿
     current_waypoint = robot.get_current_waypoint()
     ee_pos = np.array(current_waypoint['pos']) # 当前末端位置 in m
     ee_ori_rpy_rad = np.array(robot.quaternion_to_rpy(current_waypoint['ori'])) # # 当前末端姿态 in rad
     flange_pose = SE3.Trans(ee_pos[0], ee_pos[1], ee_pos[2]) * SE3.RPY(ee_ori_rpy_rad[0], ee_ori_rpy_rad[1], ee_ori_rpy_rad[2])
-    tcp_pose = (flange_pose * trans_flange2tcp)
+    trans_inTcpFrame = SE3.Trans(0.0,0.0,0.0) * SE3.RPY(0.0/180*np.pi,0.0/180*np.pi,0.0/180*np.pi) # 末端坐标系到力传感器坐标系的转换矩阵
+    tcp_pose = flange_pose * trans_flange2tcp * trans_inTcpFrame
     tcp_pos = np.array(tcp_pose.t); tcp_ori = np.array(tcp_pose.rpy())
 
-    # 模拟直线路径
-    trans_length = 0.05  # 平移距离
-    p_start = tcp_pos.copy() # 起点位置
-    # p_start[0] = p_start[0] + trans_length # 移动到最左端
+    # 起点位置和姿态设置
+    p_start_pos = tcp_pos.copy(); p_start_ori = tcp_ori.copy()
+    p_start_pos[0] -= 0.004 # 小小修正一下
+    p_start_pos[1] -= 0.002 # 小小修正一下
+    p_start_pos[2] -= 0.06 # 小小修正一下
+    desired_joint = robot_inverse_kinematic(p_start_pos,p_start_ori) # 末端期望位置 / m， 角度rqy / rad
+    logger.info(f"起点关节角度：{desired_joint}")
+    robot.move_joint(desired_joint)
+    time.sleep(1)
 
-    # desired_joint = robot_inverse_kinematic(p_start,tcp_ori) # 末端期望位置 / m， 角度rqy / rad
-    # robot.move_joint(desired_joint)
-    # time.sleep(2)
+    # 路径规划
+    num_points = 1000  # 轨迹上的点数
 
-    # 先进行路径规划, 规划每一个目标点的位姿
-    num_points = 600  # 轨迹上的点数
-    delta_steps = np.linspace(0, trans_length, num_points) # 向右平移
+    # trans_length = 0.02  # 平移距离
+    # p_start = tcp_pos.copy() # 起点位置
+    # delta_steps = np.linspace(0, trans_length, num_points) 
 
-    for delta_step in delta_steps:
+    # # 规划每一个目标点的位姿
+    # for delta_step in delta_steps:
 
-        x = p_start[0] # - delta_step
-        y = p_start[1]
-        z = p_start[2] 
-        rx = ee_ori_rpy_rad[0]
-        ry = ee_ori_rpy_rad[1]
-        rz = ee_ori_rpy_rad[2]
-        p_end = np.array([x, y, z, rx, ry, rz])
-        p_end_list.append(p_end)
+    #     x = p_start[0] 
+    #     y = p_start[1]
+    #     z = p_start[2] # + delta_step
+    #     rx = tcp_ori[0]
+    #     ry = tcp_ori[1]
+    #     rz = tcp_ori[2]
+    #     p_end = np.array([x, y, z, rx, ry, rz])
+    #     p_end_list.append(p_end)
 
-    p_end_array = np.array(p_end_list)
-    num_points = p_end_array.shape[0] # 轨迹上点的数量
+    # p_end_array = np.array(p_end_list)
+    # num_points = p_end_array.shape[0] # 轨迹上点的数量
 
     # 梯形速度轨迹规划参数
-    acc_time = 1 * control_period  # 加速时间 (s)
-    dcc_time = 1 * control_period  # 减速时间 (s)
-    joint_vel_limit = np.ones(6) * 0.03  # 每个关节的最大角速度 (rad/s)
-    joint_acc_limit = np.ones(6) * 0.04  # 计算最大角加速度
+    # acc_time = 1 * control_period  # 加速时间 (s)
+    # dcc_time = 1 * control_period  # 减速时间 (s)
+    # joint_vel_limit = np.ones(6) * 0.03  # 每个关节的最大角速度 (rad/s)
+    # joint_acc_limit = np.ones(6) * 0.04  # 计算最大角加速度
+
+    # 5次多项式轨迹规划
+    joint_vel_limit = 0.02  # 每个关节的最大角速度 (rad/s) 0.04
+    joint_acc_limit = 0.03  # 计算最大角加速度 0.08
+
     prev_joint_vel = np.zeros(6) # 保存上一周期周期的关节速度
     prev_joint_acc = np.zeros(6) # 保存上一周期周期的关节加速度
 
@@ -460,11 +496,31 @@ def admittance_controller():
 
     logger.info("进入外环导纳控制周期，控制周期{}ms".format(control_period*1000))
 
-    user_force = np.array([0.0, 0.0, 0.0, 0.0, 1.0, 0.0]) # 用户期望受力，传感器坐标系下
+    user_force_inTcp = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]) # 用户主动施加力，末端坐标系下
+    user_force_inBase = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]) # 用户主动施加力，基坐标系下
     
+    # 整个控制周期的不同阶段标志位
+    first_phase = True
+    second_phase = False
+    third_phase = False
+    completed_flag = False # 完成标志位
+    adjust_flag = False # 调整位置标志位
+
+    max_fxy_inTcp = 9 # 最大碰撞力
+    max_ty_inTcp = 0.5 # 最大碰撞扭矩
+    threshold_fxy_inTcp = 9 # 碰撞力阈值
+    threshold_ty_inTcp = 0.5 # 碰撞力阈值
+
     for i in range(num_points):
 
+        # if i <= 5:
+        #     force_data_zero()
+        #     continue # 跳过前5个点
+
         st_time = time.time()
+        logger.info("第{}个".format(i))
+
+        p_end_pos = p_start_pos.copy(); p_end_ori = p_start_ori.copy()
         
         # 获取当前关节状态和末端状态
         current_waypoint = robot.get_current_waypoint()
@@ -474,52 +530,218 @@ def admittance_controller():
         flange_pose = SE3.Trans(ee_pos[0], ee_pos[1], ee_pos[2]) * SE3.RPY(ee_ori_rpy_rad[0], ee_ori_rpy_rad[1], ee_ori_rpy_rad[2])
         tcp_pose = flange_pose * trans_flange2tcp
         tcp_pos = np.array(tcp_pose.t); tcp_ori = np.array(tcp_pose.rpy())
-
-        # # 等待并获取最新的 joint_angles 话题消息
-        all_positions_real.append(cur_joint) # in rad
-
-        # 获取当前末端位置和姿态
         controller.eef_pose = np.concatenate((tcp_pos, tcp_ori), axis=0) # 6*1
 
+        # 存储当前关节角
+        all_positions_real.append(cur_joint) # in rad
+
+        # 存储末端当前位姿
+        pose_data_list.append(controller.eef_pose) # 6*1
+
+        '''
+        插接动作规划，分为了三个阶段：
+        第一阶段: 向z+(Base)移动, 施加主动力z+(Base), 期望位置沿z+(Base), 期望姿态保持不变，直到调整结束 && 碰到孔，转到第二阶段
+        第二阶段: 施加主动力x+(Tcp), 期望位置x+ y+ z不变(Tcp), 期望姿态保持不变, 直到三点稳定接触[Fy(Tcp)>3], 转到第三阶段
+        第三阶段: 主动偏转, 施加主动力z+(Base), 期望位置保持不变, 期望姿态主动偏转rz+(Tcp), 直到贴住孔壁[Fy(Tcp)>3], 转到第三阶段
+        第四阶段: 施加主动插接力x+(Tcp), 期望位置x+(Tcp), 期望姿态保持不变, 检测接触力, 直到接触力[Fx(Tcp)>5], 结束插接
+        '''
+        # 300*0.04=12s
+        if first_phase: # 第一阶段
+
+            controller.M = np.diag([10.0, 10.0, 10.0, 10.0, 10.0, 10.0])  # 惯性矩阵
+            controller.B = np.diag([30.0, 30.0, 30.0, 20.0, 20.0, 20.0])  # 阻尼矩阵
+            controller.K = np.diag([10.0, 10.0, 10.0, 10.0, 10.0, 10.0])  # 刚度矩阵
+            user_force_inBase = np.array([0.0, 0.0, 3.0, 0.0, 0.0, 0.0])
+            p_end_pos[2] += 0.00005
+
+        elif second_phase: # 第二阶段
+
+            if adjust_flag: # 二阶段开头需要调整
+
+                controller.M = np.diag([30.0, 30.0, 30.0, 10.0, 10.0, 10.0])  # 惯性矩阵
+                controller.B = np.diag([50.0, 50.0, 50.0, 20.0, 20.0, 20.0])  # 阻尼矩阵
+                controller.K = np.diag([5.0, 5.0, 5.0, 2.0, 2.0, 2.0])  # 刚度矩阵
+      
+            else:  
+
+                user_force_inTcp = np.array([3.0, 0.0, 0.0, 0.0, 0.0, 0.0]) # 用户主动施加力, 末端坐标系下
+
+                trans_inTcpFrame = SE3.Trans(0.001,0.0005,0.0) * SE3.RPY(0.0,0.0,0.0)
+                target_pose = tcp_pose * trans_inTcpFrame
+                p_end_pos = target_pose.t
+                p_end_ori = target_pose.rpy()
+            
+        elif third_phase: # 第三阶段
+
+            controller.M = np.diag([40.0, 40.0, 40.0, 10.0, 10.0, 10.0])  # 惯性矩阵
+            controller.B = np.diag([60.0, 60.0, 60.0, 20.0, 20.0, 20.0])  # 阻尼矩阵
+            controller.K = np.diag([30.0, 30.0, 30.0, 10.0, 10.0, 10.0])  # 刚度矩阵
+
+            user_force_inTcp = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]) # 用户主动施加力, 末端坐标系下
+
+            if adjust_flag:
+                
+                trans_inTcpFrame = SE3.Trans(-0.002,0.0,0.0) * SE3.RPY(0.0,0.0,0.0)
+                target_pose = tcp_pose * trans_inTcpFrame
+                p_end_pos = target_pose.t
+                p_end_ori = target_pose.rpy()
+
+                if i - second_phase_end > 200: # 如果调整时间结束，开始第三阶段主动偏转
+
+                    adjust_flag = False
+                    third_phase_start = i # 记录下第三阶段开始时的时间
+            
+            else:
+
+                trans_inTipFrame = SE3.Trans(0.0,0.0,0.0) * SE3.RPY(0.0,0.0,3/180*np.pi)
+                trans_Tip2Tcp = SE3.Trans(0.05,0.005,0.0) * SE3.RPY(0.0,0.0,0.0)
+                trans_inTcpFrame = SE3.Trans(-0.001,-0.002,0.0) * SE3.RPY(0.0,0.0,0.0)
+                target_pose = tcp_pose * trans_inTcpFrame * trans_Tip2Tcp * trans_inTipFrame
+                p_end_pos = target_pose.t
+                p_end_ori = target_pose.rpy()
+
         # 根据规划的路径获取旧的末端期望位姿
-        des_eef_pose = p_end_array[i, :]
+        des_eef_pose = np.concatenate((p_end_pos, p_end_ori), axis=0) # 6*1
+
+        # 存储末端期望位姿
+        p_end_list.append(des_eef_pose) 
 
         # 将传感器坐标系下的力转换到末端坐标系下，注意此时受力坐标系为末端坐标系
         force2tcp = SE3.Trans(0.0, 0.0, -0.196) * SE3.RPY(0, 0, 0) # 力传感器坐标系到末端坐标系的转换矩阵
         contact_force_data_inTcp = trans_force_data(force2tcp.A, calib_force_data) # 6*1
+        contact_force_data_inTcp = contact_force_data_inTcp + user_force_inTcp # 加上用户期望受力，末端坐标系下
+        all_contact_force_inTcp.append(contact_force_data_inTcp) # 保存末端坐标系下的受力
 
-        contact_force_data_inTcp = contact_force_data_inTcp + user_force # 加上用户期望受力，末端坐标系下
+        if third_phase: # 第三阶段
+            contact_force_data_inTcp[0] = contact_force_data_inTcp[0] / 10 # 降低x轴受力
+            contact_force_data_inTcp[1] = contact_force_data_inTcp[1] / 10 # 降低y轴受力
+            contact_force_data_inTcp[2] = contact_force_data_inTcp[2] / 10 # 降低z轴受力
+            contact_force_data_inTcp[3] = contact_force_data_inTcp[3] / 10 # 降低Tx轴受力
+            contact_force_data_inTcp[4] = contact_force_data_inTcp[4] / 10 # 降低Ty轴受力
+            contact_force_data_inTcp[5] = contact_force_data_inTcp[5] / 10 # 降低Tz轴受力
 
         # 将末端坐标系下的力转换到基坐标系下
-        contact_force_data = trans_force_data(tcp_pose.A, contact_force_data_inTcp) # 6*1
+        contact_force_data_inBase = trans_force_data(tcp_pose.A, contact_force_data_inTcp) # 6*1
+        contact_force_data = contact_force_data_inBase + user_force_inBase # 加上用户期望受力，基坐标系下
+        all_contact_force_inBase.append(contact_force_data) # 保存基坐标系下的受力
 
         # 通过导纳控制器计算新的末端期望位姿
         updated_eef_pose = controller.update(des_eef_pose, des_eef_vel, contact_force_data)
         # updated_eef_pose = des_eef_pose.copy()
 
+        if first_phase: # 第一阶段
+
+            p_slover_pos = updated_eef_pose[:3] # 位置放松
+            p_slover_ori = p_start_ori.copy() # 姿态锁住不变=初始姿态
+            sensor_force = np.sqrt(np.square(contact_force_data_inTcp[0]) + np.square(contact_force_data_inTcp[1]))  # 检测碰撞力
+            sensor_torque = np.abs(contact_force_data_inTcp[4]) # 检测碰撞扭矩
+
+            if i > 5 and not adjust_flag and sensor_force > 0.5 and sensor_torque > 0.02: # 如果碰撞力Fx + Fy > 0.5 && Ty > 0.02，说明接触到了孔，在调整
+
+                adjust_flag = True
+                max_fxy_inTcp = 0 # 重置最大碰撞力
+                max_ty_inTcp = 0 # 重置最大碰撞扭矩
+
+            elif adjust_flag:
+                if sensor_force > max_fxy_inTcp:
+                    max_fxy_inTcp = sensor_force # 更新得到最大碰撞力
+                if sensor_torque > max_ty_inTcp:
+                    max_ty_inTcp = sensor_torque # 更新得到最大碰撞扭矩
+                if sensor_force <= 1 and sensor_torque <= 0.05: # 如果碰撞力Fx + Fy <= 0.5 && Ty <= 0.02，说明调整完成
+                    adjust_flag = False
+                    # 如果调整过程中最大碰撞力和扭矩都小于阈值，说明调整完成，第一阶段结束
+                    if max_fxy_inTcp < threshold_fxy_inTcp and max_ty_inTcp < threshold_ty_inTcp: # 
+                        first_phase = False
+                        second_phase = True
+                        first_phase_end = i # 记录下第一阶段结束时的时间
+                        adjust_flag = True # 二阶段开头需要调整
+                        user_force_inBase = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]) # 用户主动施加力, 基坐标系下 清零
+
+            logger.info("第一阶段") # 打印阶段信息
+            logger.info("{}".format(adjust_flag))
+
+        elif second_phase: # 第二阶段
+
+            if adjust_flag: # 二阶段开头需要调整
+
+                p_slover_pos = updated_eef_pose[:3] # x y z位置放松
+                p_slover_ori = p_start_ori.copy() # 姿态锁住不变=初始姿态
+                if np.linalg.norm(contact_force_data_inTcp[:3]) < 2 and np.linalg.norm(contact_force_data_inTcp[3:]) < 0.1:
+                    temp_pos = p_slover_pos.copy() # 记录下稳定的位置
+                    second_phase_start = i # 记录下第二阶段开始时的时间
+                    adjust_flag = False # 二阶段开头调整结束
+
+                logger.info("一二阶段过渡, 等待二阶段开始") # 打印阶段信息
+
+            else: # 二阶段开始
+
+                p_slover_pos = updated_eef_pose[:3] # x z位置放松
+                p_slover_pos[1] = temp_pos[1] # y轴位置锁住
+                p_slover_ori = p_end_ori.copy() # 姿态锁住偏转rz+(Tcp)
+                sensor_force = contact_force_data_inTcp[0]  # 检测 inTcp x轴负方向接触力
+
+
+                if sensor_force < -4: # 如果接触力大于阈值，切换到第三阶段
+
+                    second_phase = False # 二阶段结束
+                    second_phase_end = i # 记录下第二阶段结束时的时间
+
+                    third_phase = True # 三阶段开始
+                    adjust_flag = True # 三阶段开头需要调整
+
+                logger.info("第二阶段") # 打印阶段信息
+                logger.info("{}".format(adjust_flag))
+
+        elif third_phase: # 第三阶段检测插接力
+
+            p_slover_pos = updated_eef_pose[:3] # x z 位置放松
+            p_slover_pos[1] = temp_pos[1] # y轴位置锁住 
+            p_slover_ori = p_end_ori.copy() # 姿态锁住偏转rz+(Tcp)
+            sensor_force = np.abs(contact_force_data_inTcp[0]) # 检测插接力
+
+            if not adjust_flag and i - third_phase_start > 300: # 如果主动偏转时间结束，开始插接
+
+                third_phase = False
+                completed_flag = True
+                third_phase_end = i # 记录下第三阶段结束时的时间
+
+            logger.info("第三阶段") # 打印阶段信息
+            logger.info("{}".format(adjust_flag))
+
+        logger.info("sensor_force: {}".format(sensor_force))  
+        logger.info("sensor_torque: {}".format(sensor_torque))
+
         # 设置期望位置、速度和加速度
-        q_target = robot_inverse_kinematic(updated_eef_pose[:3],updated_eef_pose[3:])
+        q_target = robot_inverse_kinematic(p_slover_pos,p_slover_ori)
+        v_target = np.zeros(6)
+        a_target = np.zeros(6)
 
-        # # 5次多项式轨迹规划生成平滑轨迹
-        # positions, velocities, accelerations = generate_trajectory(
-        #     cur_joint, cur_joint_vel, cur_joint_acc,
-        #     q_target, v_target, a_target,
-        #     move_period, lookahead_time
-        # )
+        # # 梯形速度规划生成平滑轨迹
+        # _, positions, velocities = trapezoidal_velocity_corrected(cur_joint, q_target, acc_time, dcc_time, control_period, joint_vel_limit, prev_joint_vel, prev_joint_acc, joint_acc_limit)
 
-        # 梯形速度规划生成平滑轨迹
-        _, positions, velocities = trapezoidal_velocity_corrected(cur_joint, q_target, acc_time, dcc_time, control_period, joint_vel_limit, prev_joint_vel, prev_joint_acc, joint_acc_limit)
+        # 5次多项式轨迹规划生成平滑轨迹
+        _, positions, velocities, _, _ = generate_trajectory_with_constraints(
+            cur_joint, prev_joint_vel, prev_joint_acc, q_target, v_target, a_target, control_period, lookahead_time, joint_vel_limit, joint_acc_limit)
 
         # 将规划好的轨迹放进共享队列
         trajectory_queue.put(positions)
         
-        prev_joint_acc = (velocities[:,1] - prev_joint_vel) / control_period # 保存当前周期的关节加速度
-        prev_joint_vel = velocities[:,1]
+        # # 梯形速度规划
+        # prev_joint_acc = (velocities[:,1] - prev_joint_vel) / control_period # 保存当前周期的关节加速度
+        # prev_joint_vel = velocities[:,1]
+
+        # 五次多项式轨迹规划
+        prev_joint_acc = (velocities[1,:] - prev_joint_vel) / control_period # 保存当前周期的关节加速度
+        prev_joint_vel = velocities[1,:]
+
         all_positions_velocity.append(prev_joint_vel) # 保存期望关节速度
-        
+
+        if completed_flag:
+            logger.info("插接完成, 退出导纳控制周期")
+            break
+
         # 时间补偿, 保证控制周期为control_period
         elapsed_time = time.time()-st_time # 计算消耗时间=轨迹规划时间+逆运动学求解时间
-        # print('外环elapsed_time: ', elapsed_time)
         if elapsed_time > control_period:
             pass
         else:
@@ -565,9 +787,15 @@ def servo_j():
 
         # 直接can协议透传目标位置
         if flag_enter_tco2canbus and traj_index < traj_len:
-                    
-            robot.set_waypoint_to_canbus(tuple(positions[:,traj_index])) # 透传目标位置给机械臂
-            all_positions_desired.append(positions[:,traj_index]) # 保存期望关节角度
+            
+            # # 梯形速度轨迹
+            # robot.set_waypoint_to_canbus(tuple(positions[:,traj_index])) # 透传目标位置给机械臂
+            # all_positions_desired.append(positions[:,traj_index]) # 保存期望关节角度
+
+            # 5次多项式轨迹
+            robot.set_waypoint_to_canbus(tuple(positions[traj_index,:])) # 透传目标位置给机械臂
+            all_positions_desired.append(positions[traj_index,:]) # 保存期望关节角度
+
             traj_index += 1 # 更新轨迹索引
 
         else:
@@ -575,7 +803,6 @@ def servo_j():
 
         # 时间补偿, 保证内环控制周期为move_period
         elapsed_time = time.time()-st_time
-        # print('内环elapsed_time: ', elapsed_time)
         if elapsed_time > move_period:
             pass
         else:
@@ -587,6 +814,7 @@ if __name__ == '__main__':
  
     logger_init()
 
+
     # ==================socket连接力传感器====================
     server_address = ('192.168.26.103', 8896)
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -595,6 +823,7 @@ if __name__ == '__main__':
     read_force_data_running = True # 读取数据线程运行标志
     # ======================================================
     
+
     # =====================机器人连接=========================
     Auboi5Robot.initialize() 
     robot = Auboi5Robot()
@@ -611,6 +840,7 @@ if __name__ == '__main__':
     trans_flange2tcp = SE3.Trans(0, 0, 0.211) # flange to tcp
     # ======================================================
 
+
     # =========================pykin=========================
     pykin = SingleArm(f_name="./description/aubo_i10.urdf")
     pykin.setup_link_name(base_name="base_link", eef_name="Tool_Link")
@@ -619,13 +849,19 @@ if __name__ == '__main__':
     
     # =====================保存读取数据初始化===================
     start_time = time.time() # 记录程序开始时间
-    force_data_list = [] # 记录每次读取的力数据
-    pose_data_list = [] # 记录每次读取的末端位姿
+    force_data_inSensor_list = [] # 记录每次读取的力数据
     joint_data_list = [] # 记录每次读取的关节角度
-    p_end_list = [] # 记录每次规划的末端位置
+    pose_data_list = [] # 记录末端实际位姿
+    p_end_list = [] # 记录末端期望位姿
     time_list = [] # 记录每次读取的时间
     read_force_data_running = True # 读取数据线程运行标志
     G_force = np.zeros(6) # Gx Gy Gz Mgx Mgy Mgz 负载重力在力传感器坐标系下的分量
+    first_phase_end = 0 # 第一阶段结束时间
+    second_phase_start = 0 # 第二阶段开始时间
+    second_phase_end = 0 # 第二阶段结束时间
+    third_phase_start = 0 # 第三阶段开始时间
+    third_phase_end = 0 # 第三阶段结束时间
+    
     # ======================================================
 
 
@@ -657,14 +893,30 @@ if __name__ == '__main__':
     all_positions_desired = []
     all_positions_real = []
     all_positions_velocity = []
+    # 记录整段轨迹的接触力信息在不同参考坐标系下
+    all_contact_force_inTcp = [] # 在末端坐标系下
+    all_contact_force_inBase = [] # 在基座标系下
     # ======================================================
 
-    # ==========================主程序=========================
+
+    # ===========================夹具控制=========================
+    # robot.set_gripper_init() # 初始化夹具
+    # time.sleep(1)
+    # robot.set_gripper_open() # 夹具打开
+    # input("请放入插头，并按回车键继续")
+    # time.sleep(1) 
+    # robot.set_gripper_close() # 夹具闭合
+    # time.sleep(5)
+    # ==========================================================
+
+
     try:
 
+        # ==========================主程序=========================
         servo_j_thread = threading.Thread(target=servo_j) # 内环位置控制线程
         servo_j_thread.start()
         admittance_controller() # 导纳控制器
+        # ========================================================
         
     except KeyboardInterrupt: # CTRL+C退出程序
 
@@ -675,10 +927,8 @@ if __name__ == '__main__':
         logger.info("程序异常退出: ", e)
 
     finally:
-
-        robot.move_pause() # 暂停机械臂运动
-        robot.move_stop() # 停止机械臂运动
         
+        # ==========================清理工作=======================
         # 结束内环servoj线程
         servo_j_running = False
         servo_j_thread.join()
@@ -698,107 +948,109 @@ if __name__ == '__main__':
         sock.close()
 
         logger.info("程序结束, 绘制接触力/力矩和末端位置/姿态")
+        # ========================================================
 
-        # 将 force_data_list 中的 NumPy 数组转换为 Python 列表
-        force_data_list_converted = [data.tolist() for data in force_data_list]
 
-        # 将力数据保存为 JSON 文件
-        with open('force_data.json', 'w') as f:
-            json.dump(force_data_list_converted, f)
+        # ==========================数据保存=======================
+        # 保存传感器坐标系下力数据
+        force_data_inSensor_list_converted = [data.tolist() for data in force_data_inSensor_list]
+        with open('force_data_inSensor.json', 'w') as f:
+            json.dump(force_data_inSensor_list_converted, f)
 
-        # 将 all_positions_desired 中的 NumPy 数组转换为 Python 列表
+        # 保存末端坐标系下力数据
+        all_contact_force_inTcp_converted = [data.tolist() for data in all_contact_force_inTcp]
+        with open('force_data_inTcp.json', 'w') as f:
+            json.dump(all_contact_force_inTcp_converted, f)
+
+        # 保存基坐标系下力数据
+        all_contact_force_inBase_converted = [data.tolist() for data in all_contact_force_inBase]
+        with open('force_data_inBase.json', 'w') as f:
+            json.dump(all_contact_force_inBase_converted, f)
+
+        # 保存期望关节角度
         all_positions_converted_desired = [pos.tolist() for pos in all_positions_desired]
-        all_positions_real_converted = [pos.tolist() for pos in all_positions_real]
-        all_positions_velocity_converted = [pos.tolist() for pos in all_positions_velocity]
-
         with open('trajectory_data.json', 'w') as f:
             json.dump(all_positions_converted_desired, f)
         
+        # 保存实际关节角度
+        all_positions_real_converted = [pos.tolist() for pos in all_positions_real]
         with open('trajectory_data_real.json', 'w') as f:
             json.dump(all_positions_real_converted, f)
         
+        # 保存实际关节速度
+        all_positions_velocity_converted = [pos.tolist() for pos in all_positions_velocity]
         with open('trajectory_velocity_real.json', 'w') as f:
             json.dump(all_positions_velocity_converted, f)
+        # =========================================================
 
-        # 画图
-        max_time = np.round(max(time_list)+1).astype(int)
-        fig, (ax1, ax2) = plt.subplots(2, 1)
-        
-        lines1 = [ax1.plot([], [], label=label, color=color)[0] for label, color in zip(['fx', 'fy', 'fz'], ['r', 'g', 'b'])]
-        lines2 = [ax2.plot([], [], label=label, color=color)[0] for label, color in zip(['mx', 'my', 'mz'], ['r', 'g', 'b'])]
 
-        # 显示数据
-        ax1.set_ylabel('F/N')
-        ax1.legend()
-        
-        ax2.set_xlabel('Time/s')
-        ax2.set_ylabel('M/Nm')
-        ax2.legend()
+        # ==========================绘制传感器坐标系下的接触力数据（带时间戳）=======================
+        # max_time = np.round(max(time_list)+1).astype(int)
+        # fig, (ax1, ax2) = plt.subplots(2, 1)
+        # lines1 = [ax1.plot([], [], label=label, color=color)[0] for label, color in zip(['fx', 'fy', 'fz'], ['r', 'g', 'b'])]
+        # lines2 = [ax2.plot([], [], label=label, color=color)[0] for label, color in zip(['mx', 'my', 'mz'], ['r', 'g', 'b'])]
 
-        if len(time_list) == len(force_data_list) and force_data_list:
-            data = np.array(force_data_list)  # 转换为numpy数组
-            times = np.array(time_list) 
-            
-            if len(times) == data.shape[0]:
-                for i, line in enumerate(lines1):
-                    line.set_xdata(times)
-                    line.set_ydata(data[:, i])
+        # # 显示数据
+        # ax1.set_ylabel('F/N'); ax1.legend()
+        # ax2.set_xlabel('Time/s'); ax2.set_ylabel('M/Nm'); ax2.legend()
+
+        # if len(time_list) == len(force_data_inSensor_list) and force_data_inSensor_list:
+        #     data = np.array(force_data_inSensor_list)  # 转换为numpy数组
+        #     times = np.array(time_list) 
+        #     if len(times) == data.shape[0]:
+        #         for i, line in enumerate(lines1):
+        #             line.set_xdata(times)
+        #             line.set_ydata(data[:, i])
+        #         for i, line in enumerate(lines2):
+        #             line.set_xdata(times)
+        #             line.set_ydata(data[:, i + 3])
+        #         ax1.set_xlim(0, max_time)
+        #         ax1.set_ylim(np.min(data[:, :3]) - 1, np.max(data[:, :3]) + 1)
+        #         ax2.set_xlim(0, max_time)
+        #         ax2.set_ylim(np.min(data[:, 3:]) - 1, np.max(data[:, 3:]) + 1)
+
+        # plt.tight_layout()
+        # plt.savefig('force_data.png')
+        # ========================================================================================
                 
-                for i, line in enumerate(lines2):
-                    line.set_xdata(times)
-                    line.set_ydata(data[:, i + 3])
-                
-                ax1.set_xlim(0, max_time)
-                ax1.set_ylim(np.min(data[:, :3]) - 1, np.max(data[:, :3]) + 1)
-                
-                ax2.set_xlim(0, max_time)
-                ax2.set_ylim(np.min(data[:, 3:]) - 1, np.max(data[:, 3:]) + 1)
 
-        plt.tight_layout()
-        plt.savefig('force_data.png')
-                
-        # 画末端位置和姿态图
-        fig2, (ax3, ax4) = plt.subplots(2, 1)
-        
-        lines3 = [ax3.plot([], [], label=label, color=color)[0] for label, color in zip(['x', 'y', 'z'], ['r', 'g', 'b'])]
-        lines4 = [ax4.plot([], [], label=label, color=color)[0] for label, color in zip(['rx', 'ry', 'rz'], ['r', 'g', 'b'])]
+        # ====================================画末端位置和姿态图=====================================
+        # 创建一个窗口，包含6个子图
+        fig2, axes = plt.subplots(6, 1, figsize=(12, 18))
+        pose_labels = ['x/m', 'y/m', 'z/m', 'rx/rad', 'ry/rad', 'rz/rad']
+        colors = ['r', 'g', 'b', 'r', 'g', 'b']
 
-        ax3.set_ylabel('Pos/m')
-        ax3.legend()
-        
-        ax4.set_xlabel('Time/s')
-        ax4.set_ylabel('Ori/degree')
-        ax4.legend()
+        # 获取样本数量
+        pose_data_array = np.array(pose_data_list)
+        n_samples = pose_data_array.shape[0]
 
-        if len(time_list) == len(pose_data_list) and pose_data_list:
-            pose_data = np.array(pose_data_list)  # 转换为numpy数组
-            times = np.array(time_list)         
+        # 绘制末端位姿变化曲线
+        for i in range(6):
+            axes[i].plot(np.arange(n_samples), pose_data_array[:, i], label=pose_labels[i], color=colors[i])
+            axes[i].set_ylabel(pose_labels[i])
+            axes[i].legend()
+            axes[i].grid(True)
+            # 添加垂直于x轴的直线
+            axes[i].axvline(x=first_phase_end, color='r', linestyle='--')
+            axes[i].axvline(x=second_phase_start, color='g', linestyle='--')
+            axes[i].axvline(x=second_phase_end, color='g', linestyle='--')
+            axes[i].axvline(x=third_phase_start, color='b', linestyle='--')
+            axes[i].axvline(x=third_phase_end, color='b', linestyle='--')
 
-            if len(times) == pose_data.shape[0]:
-                for i, line in enumerate(lines3):
-                    line.set_xdata(times)
-                    line.set_ydata(pose_data[:, i])
-                
-                for i, line in enumerate(lines4):
-                    line.set_xdata(times)
-                    line.set_ydata(pose_data[:, i + 3])
-                
-                ax3.set_xlim(0, max_time)
-                ax3.set_ylim(np.min(pose_data[:, :3]) - 0.5, np.max(pose_data[:, :3]) + 0.5)
-                
-                ax4.set_xlim(0, max_time)
-                ax4.set_ylim(np.min(pose_data[:, 3:]) - 10, np.max(pose_data[:, 3:]) + 10)
-
+        axes[5].set_xlabel('Sample')
         plt.tight_layout()
         plt.savefig('pose_data.png')
+        # ========================================================================================
 
+
+        # ===========================画末端期望位置和实际位置轨迹图（3D空间）===========================
         # 创建一个三维图形
         fig3 = plt.figure()
         ax = fig3.add_subplot(111, projection='3d')
         p_end_array = np.array(p_end_list)
 
         # 绘制末端实际位置的三维轨迹（蓝色）
-        ax.plot(pose_data[:, 0], pose_data[:, 1], pose_data[:, 2], color='b', label='End Effector Position')
+        ax.plot(pose_data_array[:, 0], pose_data_array[:, 1], pose_data_array[:, 2], color='b', label='End Effector Position')
         # 绘制末端期望位置的三维轨迹（红色）
         ax.plot(p_end_array[:, 0], p_end_array[:, 1], p_end_array[:, 2], color='r', label='Desired End Effector Position')
         
@@ -809,4 +1061,153 @@ if __name__ == '__main__':
         ax.set_title('End Effector Position Trajectory')
         ax.legend()
         plt.savefig('end_effector_position_trajectory.png')
+        # ========================================================================================
+
+
+        # ==============================实际关节速度曲线==============================
+        # trajectory_velocity_real = np.array(all_positions_velocity)
+        # n_samples = trajectory_velocity_real.shape[0]
+
+        # # 创建一个窗口，包含6个子图
+        # fig, axes = plt.subplots(6, 1, figsize=(12, 18))
+        # joint_labels = ['Joint 1', 'Joint 2', 'Joint 3', 'Joint 4', 'Joint 5', 'Joint 6']
+
+        # # 绘制每个关节的变化曲线
+        # for i in range(6):
+
+        #     axes[i].plot(np.arange(n_samples), trajectory_velocity_real[:, i], label=f'Velocities {joint_labels[i]}', color='green')
+        #     axes[i].set_ylabel('Angle (rad)')
+        #     axes[i].legend()
+        #     axes[i].grid(True)
+
+        # axes[5].set_xlabel('Sample')
+        # plt.tight_layout()
+        # plt.savefig('trajectory_velocity_real.png')
+        # ==========================================================================
+
+
+        # ==============================实际关节加速度曲线==============================
+        # trajectory_acc_real = np.diff(trajectory_velocity_real, axis=0) / 0.04
+        # n_samples = trajectory_acc_real.shape[0]
+        # print(trajectory_acc_real.shape[0])
+
+        # # 创建一个窗口，包含6个子图
+        # fig, axes = plt.subplots(6, 1, figsize=(12, 18))
+        # joint_labels = ['Joint 1', 'Joint 2', 'Joint 3', 'Joint 4', 'Joint 5', 'Joint 6']
+
+        # # 绘制每个关节的变化曲线
+        # for i in range(6):
+
+        #     axes[i].plot(np.arange(n_samples), trajectory_acc_real[:, i], label=f'acceleration {joint_labels[i]}', color='orange')
+        #     axes[i].set_ylabel('Angle (rad)')
+        #     axes[i].legend()
+        #     axes[i].grid(True)
+
+        # axes[5].set_xlabel('Sample')
+        # plt.tight_layout()
+        # plt.savefig('trajectory_acc_real.png')
+        # ============================================================================
+
+
+        # ==============================实际关节变化曲线==============================
+        # trajectory_array_real = np.array(all_positions_real)
+        # # 获取样本数量
+        # n_samples = trajectory_array_real.shape[0]
+
+        # # 创建一个窗口，包含6个子图
+        # fig, axes = plt.subplots(6, 1, figsize=(12, 18))
+        # joint_labels = ['Joint 1', 'Joint 2', 'Joint 3', 'Joint 4', 'Joint 5', 'Joint 6']
+
+        # # 绘制每个关节的变化曲线
+        # for i in range(6):
+
+        #     axes[i].plot(np.arange(n_samples), trajectory_array_real[:, i], label=f'Real {joint_labels[i]}', color='red')
+        #     axes[i].set_ylabel('Angle (rad)')
+        #     axes[i].legend()
+        #     axes[i].grid(True)
+
+        # axes[5].set_xlabel('Sample')
+        # plt.tight_layout()
+        # plt.savefig('trajectory_array_real.png')
+        # =========================================================================
+
+
+        # ==============================期望关节变化曲线==============================
+        # trajectory_array = np.array(all_positions_desired)
+        # # 创建一个窗口，包含6个子图
+        # fig, axes = plt.subplots(6, 1, figsize=(12, 18))
+        # joint_labels = ['Joint 1', 'Joint 2', 'Joint 3', 'Joint 4', 'Joint 5', 'Joint 6']
+
+        # # 获取样本数量
+        # n_samples = trajectory_array.shape[0]
+
+        # # 绘制每个关节的变化曲线
+        # for i in range(6):
+
+        #     axes[i].plot(np.arange(n_samples), trajectory_array[:, i], label=f'Desired {joint_labels[i]}' ,color='blue')
+        #     axes[i].set_ylabel('Angle (rad)')
+        #     axes[i].legend()
+        #     axes[i].grid(True)
+
+        # axes[5].set_xlabel('Sample')
+        # plt.tight_layout()
+        # plt.savefig('trajectory_array_desired.png')
+        # ==========================================================================
+
+
+        # ==============================末端坐标系下接触力曲线==========================
+        force_data_inTcp = np.array(all_contact_force_inTcp)
+        # 创建一个窗口，包含6个子图
+        fig, axes = plt.subplots(6, 1, figsize=(12, 18))
+        force_labels = ['Fx', 'Fy', 'Fz', 'Tx', 'Ty', 'Tz']
+
+        # 获取样本数量
+        n_samples = force_data_inTcp.shape[0]
+
+        # 绘制每个关节的变化曲线
+        for i in range(6):
+
+            axes[i].plot(np.arange(n_samples), force_data_inTcp[:, i], label=f'Force_inTcp {force_labels[i]}', color='magenta')
+            axes[i].set_ylabel('Force (N)')
+            axes[i].legend()
+            axes[i].grid(True)
+            # 添加垂直于x轴的直线
+            axes[i].axvline(x=first_phase_end, color='r', linestyle='--')
+            axes[i].axvline(x=second_phase_start, color='g', linestyle='--')
+            axes[i].axvline(x=second_phase_end, color='g', linestyle='--')
+            axes[i].axvline(x=third_phase_start, color='b', linestyle='--')
+            axes[i].axvline(x=third_phase_end, color='b', linestyle='--')
+
+        axes[5].set_xlabel('Sample')
+        plt.tight_layout()
+        plt.savefig('force_data_inTcp.png')
+        # ==========================================================================
+
+
+        # ==============================基座坐标系下接触力曲线==========================
+        # force_data_inBase = np.array(all_contact_force_inBase)
+        # # 创建一个窗口，包含6个子图
+        # fig, axes = plt.subplots(6, 1, figsize=(12, 18))
+        # force_labels = ['Fx', 'Fy', 'Fz', 'Tx', 'Ty', 'Tz']
+
+        # # 获取样本数量
+        # n_samples = force_data_inBase.shape[0]
+
+        # # 绘制每个关节的变化曲线
+        # for i in range(6):
+
+        #     axes[i].plot(np.arange(n_samples), force_data_inBase[:, i], label=f'Force_inBase {force_labels[i]}', color='purple')
+        #     axes[i].set_ylabel('Force (N)')
+        #     axes[i].legend()
+        #     axes[i].grid(True)
+        #     # 添加垂直于x轴的直线
+        #     axes[i].axvline(x=first_phase_end, color='k', linestyle='--')
+        #     axes[i].axvline(x=second_phase_start, color='k', linestyle='--')
+        #     axes[i].axvline(x=second_phase_end, color='k', linestyle='--')
+
+        # axes[5].set_xlabel('Sample')
+        # plt.tight_layout()
+        # plt.savefig('force_data_inBase.png')
+        # ==========================================================================
+
         plt.show()

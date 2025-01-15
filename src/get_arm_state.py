@@ -75,6 +75,11 @@ if __name__ == '__main__':
 
             robot.init_profile() # 初始化全局配置文件 自动清理掉之前设置的用户坐标系，速度，加速度等属性
 
+            robot.leave_tcp2canbus_mode()
+            logger.info("结束外环控制周期，退出 TCP 转 CAN 透传模式")
+
+            robot.move_stop()
+
             trans_flange2tcp = SE3.Trans(0, 0, 0.211) # flange to tcp
 
             # 获取机械臂状态
