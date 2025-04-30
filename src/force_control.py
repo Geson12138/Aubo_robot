@@ -1,7 +1,5 @@
 import os
 import sys
-import logging
-from logging.handlers import RotatingFileHandler
 import numpy as np
 import matplotlib.pyplot as plt
 import time
@@ -21,6 +19,8 @@ from std_msgs.msg import Float64MultiArray
 import queue
 import concurrent.futures
 from spatialmath import SE3
+import logging
+from logging.handlers import RotatingFileHandler
 
 
 # 创建一个logger
@@ -592,7 +592,10 @@ def admittance_controller():
                     third_phase_start = i # 记录下第三阶段开始时的时间
             
             else:
-
+                
+                '''
+                这里需要做一个绕指尖的旋转
+                '''
                 trans_inTipFrame = SE3.Trans(0.0,0.0,0.0) * SE3.RPY(0.0,0.0,3/180*np.pi)
                 trans_Tip2Tcp = SE3.Trans(0.05,0.005,0.0) * SE3.RPY(0.0,0.0,0.0)
                 trans_inTcpFrame = SE3.Trans(-0.001,-0.002,0.0) * SE3.RPY(0.0,0.0,0.0)

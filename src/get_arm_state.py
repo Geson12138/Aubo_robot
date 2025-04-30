@@ -60,9 +60,7 @@ if __name__ == '__main__':
     try:
 
         # 链接服务器
-        ip = 'localhost'
-        ip = '192.168.26.103'
-
+        ip = '192.168.1.181'
         port = 8899
         result = robot.connect(ip, port)
 
@@ -80,7 +78,7 @@ if __name__ == '__main__':
 
             robot.move_stop()
 
-            trans_flange2tcp = SE3.Trans(0, 0, 0.211) # flange to tcp
+            trans_tcp2flange = SE3.Trans(0, 0, 0.211) # tcp 2 flange
 
             # 获取机械臂状态
             st_time = time.time()
@@ -105,7 +103,7 @@ if __name__ == '__main__':
             print(f"直接获取-末端oritation:{[rq for rq in ee_ori_rpy_deg]} in degree")
 
             flange_pose = SE3.Trans(ee_pos[0], ee_pos[1], ee_pos[2]) * SE3.RPY(ee_ori_rpy_rad[0], ee_ori_rpy_rad[1], ee_ori_rpy_rad[2])
-            tcp_pose = (flange_pose * trans_flange2tcp)
+            tcp_pose = (flange_pose * trans_tcp2flange)
             tcp_pos = tcp_pose.t; tcp_ori = tcp_pose.rpy()
             tcp_mat = tcp_pose.R
 
